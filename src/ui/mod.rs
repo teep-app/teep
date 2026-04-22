@@ -101,6 +101,19 @@ fn render_header(state: &AppState, area: ratatui::layout::Rect, frame: &mut Fram
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        // Count files the git dot is actually reacting to, so the dot's
+        // color has a readable partner.
+        let dirty_count = snap
+            .status
+            .iter()
+            .filter(|s| !matches!(s.kind, crate::git::StatusKind::Ignored))
+            .count();
+        if dirty_count > 0 {
+            spans.push(Span::styled(
+                format!(" · {dirty_count} modified"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
     } else {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -116,10 +129,10 @@ fn render_header(state: &AppState, area: ratatui::layout::Rect, frame: &mut Fram
     ));
     spans.push(Span::raw("  "));
     spans.push(if unseen == 0 {
-        Span::styled("no new changes", Style::default().fg(Color::DarkGray))
+        Span::styled("all reviewed", Style::default().fg(Color::DarkGray))
     } else {
         Span::styled(
-            format!("● {unseen} new"),
+            format!("● {unseen} to review"),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),

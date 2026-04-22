@@ -570,6 +570,10 @@ pub(crate) fn is_noise(path: &Path) -> bool {
 
 fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<LoadedFile, String>) {
     state.changes.mark_seen(&path);
+    // Detect an auto-reload (same path already open) so we can surface the
+    // "↻ reloaded" toast — otherwise silent reloads leave the user wondering
+    // whether HITLed even noticed.
+    let is_reload = state.open_file.as_ref().is_some_and(|f| f.path == path);
     // Reloading a file always invalidates its diff (it's vs HEAD of on-disk bytes).
     match result {
         Ok(loaded) => {
@@ -594,6 +598,9 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff_error: None,
             });
             state.focus = Focus::Viewer;
+            if is_reload {
+                set_status(state, "↻ reloaded".to_string());
+            }
         }
         Err(e) => {
             let msg = format!("failed: {e}");
@@ -1348,6 +1355,54 @@ mod tests {
             cmds.iter()
                 .any(|c| matches!(c, Cmd::ReRoot(p) if p == &PathBuf::from("/a"))),
             "expected Cmd::ReRoot(/a)"
+        );
+    }
+
+    #[test]
+    fn file_loaded_flashes_reloaded_when_already_open() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/a.rs"),
+            text: String::new(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+        });
+        update(
+            &mut s,
+            Msg::FileLoaded {
+                path: PathBuf::from("/tmp/a.rs"),
+                result: Ok(LoadedFile {
+                    text: String::new(),
+                    highlighted: Arc::new(vec![Line::from("x")]),
+                }),
+            },
+        );
+        let (msg, _) = s.status.as_ref().expect("reload should produce a toast");
+        assert!(msg.contains("reloaded"), "got {msg}");
+    }
+
+    #[test]
+    fn file_loaded_first_time_does_not_flash_reloaded() {
+        let mut s = fixture();
+        assert!(s.open_file.is_none());
+        update(
+            &mut s,
+            Msg::FileLoaded {
+                path: PathBuf::from("/tmp/a.rs"),
+                result: Ok(LoadedFile {
+                    text: String::new(),
+                    highlighted: Arc::new(vec![Line::from("x")]),
+                }),
+            },
+        );
+        // Fresh open — should not produce the reload toast.
+        assert!(
+            s.status.is_none(),
+            "first-time open should not flash reloaded"
         );
     }
 
