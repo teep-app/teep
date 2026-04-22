@@ -55,6 +55,13 @@ async fn main() -> Result<()> {
     };
     info!(?root, "starting hitled");
 
+    // Probe the terminal for its graphics-protocol capability BEFORE we go
+    // into raw mode + alt screen. The query sends escape sequences to stdout
+    // and reads the response from stdin; once crossterm's event loop owns
+    // stdin the response is unreachable and we'd silently fall back to
+    // halfblocks (very pixelated image output).
+    image::init_early();
+
     install_panic_hook();
     let mut terminal = setup_terminal().context("setting up terminal")?;
 

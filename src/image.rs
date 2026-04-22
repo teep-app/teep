@@ -19,11 +19,21 @@ static PICKER: OnceLock<Mutex<Picker>> = OnceLock::new();
 
 fn picker() -> &'static Mutex<Picker> {
     PICKER.get_or_init(|| {
-        // Query the terminal for pixel size + graphics protocol support.
-        // Falls back to halfblocks if stdio isn't a terminal (tests, pipes).
+        // Fallback path: if nobody called `init_early` before the terminal
+        // was put in raw mode + alt screen, the query below will usually
+        // fail (crossterm's event stream eats the response) and we end up
+        // in halfblocks. Callers should prefer `init_early()` from main.
         let p = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
         Mutex::new(p)
     })
+}
+
+/// Run the terminal-capability query eagerly, while stdio is still normal
+/// (before `enable_raw_mode()` / alt-screen setup). This is the only way the
+/// Kitty / iTerm2 / Sixel detection sequence can round-trip without being
+/// eaten by the ratatui/crossterm event reader later. Idempotent.
+pub fn init_early() {
+    let _ = picker();
 }
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
