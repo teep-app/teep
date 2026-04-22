@@ -11,7 +11,10 @@ use ratatui::{
 use crate::syntax;
 
 /// Parse `text` as GFM markdown and produce a flat, pre-styled line sequence
-/// ready for rendering in a `Paragraph`-style widget.
+/// ready for rendering in a `Paragraph`-style widget. Retained for tests and
+/// any future Reading-View (fully-cooked, read-only) surface; the interactive
+/// viewer now uses the per-block `live::parse_blocks` instead.
+#[allow(dead_code)]
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let arena = Arena::new();
     let options = build_options();
@@ -27,7 +30,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     out
 }
 
-fn build_options<'a>() -> Options<'a> {
+pub(crate) fn build_options<'a>() -> Options<'a> {
     let mut options = Options::default();
     options.extension.table = true;
     options.extension.strikethrough = true;
@@ -36,6 +39,15 @@ fn build_options<'a>() -> Options<'a> {
     options.extension.footnotes = true;
     options.parse.smart = false;
     options
+}
+
+/// Render a single top-level AST block into its cooked line sequence.
+/// Used by the live-preview module to compose per-block output with
+/// source-range metadata.
+pub(crate) fn render_block_to_lines<'a>(node: &'a AstNode<'a>) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    render_block(node, &mut out, 0);
+    out
 }
 
 fn render_block<'a>(node: &'a AstNode<'a>, out: &mut Vec<Line<'static>>, indent: usize) {

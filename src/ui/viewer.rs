@@ -27,15 +27,14 @@ fn render_header(state: &AppState, area: Rect, frame: &mut Frame) {
             } else if matches!(f.edit, EditState::Deleted { .. }) {
                 " [file removed]"
             } else if let EditState::Edit(b) = &f.edit {
-                if b.is_dirty() {
-                    " [edit · unsaved]"
-                } else {
-                    " [edit]"
+                match (b.is_live_preview(), b.is_dirty()) {
+                    (true, true) => " [live · unsaved]",
+                    (true, false) => " [live preview]",
+                    (false, true) => " [edit · unsaved]",
+                    (false, false) => " [edit]",
                 }
             } else if matches!(f.edit, EditState::Conflict { .. }) {
                 " [edit · conflict]"
-            } else if f.preview_mode {
-                " [markdown preview]"
             } else if f.diff_mode {
                 " [diff vs HEAD]"
             } else {
@@ -108,11 +107,6 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
         EditState::View => {}
     }
 
-    if open.preview_mode {
-        render_preview(open, inner, frame);
-        return;
-    }
-
     if open.diff_mode {
         render_diff(open, inner, frame);
         return;
@@ -152,23 +146,6 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
 
     let body: Vec<Line> = open.highlighted[start..end].to_vec();
     frame.render_widget(Paragraph::new(body), content_area);
-}
-
-fn render_preview(open: &OpenFile, area: Rect, frame: &mut Frame) {
-    let Some(md) = &open.rendered_markdown else {
-        let p = Paragraph::new(Line::from(Span::styled(
-            " (preview not available — loading...)",
-            Style::default().fg(Color::DarkGray),
-        )));
-        frame.render_widget(p, area);
-        return;
-    };
-    let total = md.len();
-    let start = open.scroll.min(total);
-    let end = (start + area.height as usize).min(total);
-    let body: Vec<Line> = md[start..end].to_vec();
-    let p = Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false });
-    frame.render_widget(p, area);
 }
 
 fn render_diff(open: &OpenFile, area: Rect, frame: &mut Frame) {
@@ -224,7 +201,83 @@ fn render_diff(open: &OpenFile, area: Rect, frame: &mut Frame) {
 }
 
 fn render_edit(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
-    frame.render_widget(&buffer.textarea, area);
+    if buffer.live_blocks.is_some() {
+        render_live_preview(buffer, area, frame);
+    } else {
+        frame.render_widget(&buffer.textarea, area);
+    }
+}
+
+/// Render a markdown buffer in Live Preview mode: the block whose source
+/// range contains the cursor renders as raw text (so you can see `##`,
+/// `**`, `|`); every other block renders cooked. Cursor is placed on the
+/// raw block; the mode is always editable.
+fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
+    let blocks = buffer
+        .live_blocks
+        .as_ref()
+        .expect("called with live blocks");
+    let (cursor_row, cursor_col) = buffer.textarea.cursor();
+    let current_block_idx = crate::markdown::block_at_row(blocks, cursor_row);
+
+    let mut visual: Vec<Line<'static>> = Vec::new();
+    let mut cursor_visual: Option<(usize, usize)> = None;
+
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 {
+            visual.push(Line::from(""));
+        }
+        if Some(i) == current_block_idx {
+            // Raw form: render the buffer's source lines for this block range.
+            for src_row in block.source_start..block.source_end {
+                if let Some(line_text) = buffer.textarea.lines().get(src_row) {
+                    if src_row == cursor_row {
+                        cursor_visual = Some((visual.len(), cursor_col));
+                    }
+                    visual.push(Line::from(Span::raw(line_text.clone())));
+                }
+            }
+        } else {
+            for cooked in &block.cooked {
+                visual.push(cooked.clone());
+            }
+        }
+    }
+
+    // If the cursor is on a line the parser skipped (blank between blocks),
+    // show that line raw so the cursor has somewhere to sit.
+    if cursor_visual.is_none()
+        && let Some(line_text) = buffer.textarea.lines().get(cursor_row)
+    {
+        cursor_visual = Some((visual.len(), cursor_col));
+        visual.push(Line::from(Span::raw(line_text.clone())));
+    }
+
+    // Scroll so the cursor row is inside the viewport.
+    let height = area.height as usize;
+    let cursor_row_visual = cursor_visual.map(|(r, _)| r).unwrap_or(0);
+    let scroll = if height == 0 || cursor_row_visual < height {
+        0
+    } else {
+        cursor_row_visual + 1 - height
+    };
+    let total = visual.len();
+    let start = scroll.min(total);
+    let end = (start + height).min(total);
+    let body: Vec<Line> = visual[start..end].to_vec();
+    frame.render_widget(Paragraph::new(body), area);
+
+    if let Some((vrow, vcol)) = cursor_visual
+        && vrow >= start
+        && vrow < end
+    {
+        let x = area
+            .x
+            .saturating_add(vcol as u16)
+            .min(area.x + area.width.saturating_sub(1));
+        let y = area.y.saturating_add((vrow - start) as u16);
+        frame.set_cursor_position((x, y));
+    }
 }
 
 fn banner<'a>(text: &'a str, fg: Color, bg: Color) -> Paragraph<'a> {

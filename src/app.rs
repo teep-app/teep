@@ -18,6 +18,7 @@ use crate::{
     finder::{self, FinderState},
     fs_watch,
     git::{DiffLine, GitSnapshot, WorktreeEntry},
+    markdown::{self, LiveBlock},
     runtime::Runtime,
     tree::{self, NodeKind, Tree},
 };
@@ -126,12 +127,8 @@ pub struct OpenFile {
     pub diff: Option<Arc<Vec<DiffLine>>>,
     pub diff_error: Option<String>,
 
-    // M5: edit state
+    // M5: edit state (M6.5: markdown files get EditState::Edit with live_blocks populated)
     pub edit: EditState,
-
-    // M6: markdown preview
-    pub preview_mode: bool,
-    pub rendered_markdown: Option<Arc<Vec<Line<'static>>>>,
 }
 
 /// True for file extensions we treat as markdown for preview purposes.
@@ -159,6 +156,9 @@ pub struct EditBuffer {
     pub textarea: TextArea<'static>,
     /// Text as it was on disk when we entered (or last saved) — used to detect "dirty".
     pub base_text: String,
+    /// `Some(blocks)` when this buffer is a markdown file in Live Preview
+    /// mode (M6.5). `None` for plain-text editing of non-markdown files.
+    pub live_blocks: Option<Vec<LiveBlock>>,
 }
 
 impl EditBuffer {
@@ -167,6 +167,19 @@ impl EditBuffer {
         Self {
             textarea: TextArea::new(lines),
             base_text: initial.to_string(),
+            live_blocks: None,
+        }
+    }
+
+    /// Construct an edit buffer that starts in Live Preview mode
+    /// (markdown blocks parsed and ready to be rendered cooked/raw).
+    pub fn new_live(initial: &str) -> Self {
+        let blocks = markdown::parse_blocks(initial);
+        let lines: Vec<String> = initial.split('\n').map(|s| s.to_string()).collect();
+        Self {
+            textarea: TextArea::new(lines),
+            base_text: initial.to_string(),
+            live_blocks: Some(blocks),
         }
     }
 
@@ -177,12 +190,24 @@ impl EditBuffer {
     pub fn is_dirty(&self) -> bool {
         self.current_text() != self.base_text
     }
+
+    /// Re-parse the buffer's current text into live-preview blocks.
+    /// Called after any mutation when in Live Preview mode.
+    pub fn refresh_live_blocks(&mut self) {
+        if self.live_blocks.is_some() {
+            let text = self.current_text();
+            self.live_blocks = Some(markdown::parse_blocks(&text));
+        }
+    }
+
+    pub fn is_live_preview(&self) -> bool {
+        self.live_blocks.is_some()
+    }
 }
 
 pub struct LoadedFile {
     pub text: String,
     pub highlighted: Arc<Vec<Line<'static>>>,
-    pub rendered_markdown: Option<Arc<Vec<Line<'static>>>>,
 }
 
 pub enum Msg {
@@ -324,7 +349,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
             set_status(state, "refreshing tree...".to_string());
         }
         (KeyCode::Char('d'), _) => toggle_diff(state, cmds),
-        (KeyCode::Char('m'), _) => toggle_preview(state),
+        (KeyCode::Char('m'), _) => m_key(state),
         (KeyCode::Char('g'), _) => open_git_status(state),
         (KeyCode::Char('b'), _) => open_worktree_switcher(state),
         (KeyCode::Char('i'), _) | (KeyCode::Char('e'), _) => enter_edit_mode(state),
@@ -347,9 +372,13 @@ fn enter_edit_mode(state: &mut AppState) {
     if !matches!(open.edit, EditState::View) {
         return;
     }
-    // Edit and diff are mutually exclusive views.
     open.diff_mode = false;
-    let buffer = EditBuffer::new(&open.text);
+    // Markdown files enter Live Preview; everything else gets plain text edit.
+    let buffer = if is_markdown_path(&open.path) {
+        EditBuffer::new_live(&open.text)
+    } else {
+        EditBuffer::new(&open.text)
+    };
     open.edit = EditState::Edit(buffer);
     state.focus = Focus::Viewer;
 }
@@ -374,13 +403,17 @@ fn handle_edit_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
         save_current(state, cmds);
         return;
     }
-    // Everything else flows into the text area.
+    // Everything else flows into the text area. Re-parse Live Preview
+    // blocks after any mutation.
     let Some(open) = state.open_file.as_mut() else {
         return;
     };
     if let EditState::Edit(buffer) = &mut open.edit {
         let input: Input = Input::from(key);
-        buffer.textarea.input(input);
+        let mutated = buffer.textarea.input(input);
+        if mutated && buffer.is_live_preview() {
+            buffer.refresh_live_blocks();
+        }
     }
 }
 
@@ -467,8 +500,10 @@ fn handle_file_saved(state: &mut AppState, path: PathBuf, result: Result<(), Str
     }
 }
 
-fn toggle_preview(state: &mut AppState) {
-    let Some(open) = state.open_file.as_mut() else {
+/// `m` on a markdown file enters Live Preview (unified with `i`/`e`).
+/// On non-markdown files it just toasts — there's nothing to preview.
+fn m_key(state: &mut AppState) {
+    let Some(open) = state.open_file.as_ref() else {
         set_status(state, "no file open".to_string());
         return;
     };
@@ -476,13 +511,7 @@ fn toggle_preview(state: &mut AppState) {
         set_status(state, "preview is only for markdown files".to_string());
         return;
     }
-    open.preview_mode = !open.preview_mode;
-    // Entering preview mode exits diff mode — the two viewer layouts don't combine.
-    if open.preview_mode {
-        open.diff_mode = false;
-        // Reset scroll — rendered line count != source line count.
-        open.scroll = 0;
-    }
+    enter_edit_mode(state);
 }
 
 fn toggle_diff(state: &mut AppState, cmds: &mut Vec<Cmd>) {
@@ -873,11 +902,6 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 .as_ref()
                 .filter(|f| f.path == path)
                 .is_some_and(|f| f.diff_mode);
-            let preview_mode = state
-                .open_file
-                .as_ref()
-                .filter(|f| f.path == path)
-                .is_some_and(|f| f.preview_mode);
             state.open_file = Some(OpenFile {
                 path,
                 text: loaded.text,
@@ -888,8 +912,6 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff: None,
                 diff_error: None,
                 edit: EditState::View,
-                preview_mode,
-                rendered_markdown: loaded.rendered_markdown,
             });
             state.focus = Focus::Viewer;
             if is_reload {
@@ -908,8 +930,6 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff: None,
                 diff_error: None,
                 edit: EditState::View,
-                preview_mode: false,
-                rendered_markdown: None,
             });
             set_status(state, msg);
         }
@@ -1170,8 +1190,6 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
-            preview_mode: false,
-            rendered_markdown: None,
         });
         let cmds = update(&mut s, Msg::FsChanged(vec![tmpfile.clone()]));
         assert_eq!(s.changes.entries().len(), 1);
@@ -1304,8 +1322,6 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
-            preview_mode: false,
-            rendered_markdown: None,
         });
         s.mouse_layout = MouseLayout {
             viewer: Rect {
@@ -1376,7 +1392,6 @@ mod tests {
                 result: Ok(LoadedFile {
                     text: "hi\n".to_string(),
                     highlighted: Arc::new(vec![Line::from("hi")]),
-                    rendered_markdown: None,
                 }),
             },
         );
@@ -1399,8 +1414,6 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
-            preview_mode: false,
-            rendered_markdown: None,
         });
         update(
             &mut s,
@@ -1556,8 +1569,6 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
-            preview_mode: false,
-            rendered_markdown: None,
         });
         // First press: enter diff mode + request computation.
         let cmds = update(&mut s, Msg::Key(plain('d')));
@@ -1673,27 +1684,72 @@ mod tests {
     }
 
     #[test]
-    fn m_toggles_preview_for_markdown_file() {
+    fn m_on_markdown_enters_live_preview() {
         let mut s = fixture();
         s.open_file = Some(OpenFile {
             path: PathBuf::from("/tmp/readme.md"),
-            text: "# hi\n".to_string(),
+            text: "# hi\n\nBody\n".to_string(),
             highlighted: Arc::new(Vec::new()),
-            scroll: 5,
+            scroll: 0,
             error: None,
             diff_mode: false,
             diff: None,
             diff_error: None,
             edit: EditState::View,
-            preview_mode: false,
-            rendered_markdown: None,
         });
         update(&mut s, Msg::Key(plain('m')));
-        assert!(s.open_file.as_ref().unwrap().preview_mode);
-        // Entering preview resets scroll (line count differs from source).
-        assert_eq!(s.open_file.as_ref().unwrap().scroll, 0);
-        update(&mut s, Msg::Key(plain('m')));
-        assert!(!s.open_file.as_ref().unwrap().preview_mode);
+        match &s.open_file.as_ref().unwrap().edit {
+            EditState::Edit(b) => {
+                assert!(b.is_live_preview(), "markdown file should have live_blocks");
+                assert!(!b.live_blocks.as_ref().unwrap().is_empty());
+            }
+            other => panic!(
+                "expected Edit(live), got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn i_on_markdown_also_enters_live_preview() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/doc.md"),
+            text: "# x\n".to_string(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+        });
+        update(&mut s, Msg::Key(plain('i')));
+        match &s.open_file.as_ref().unwrap().edit {
+            EditState::Edit(b) => assert!(b.is_live_preview()),
+            _ => panic!("expected Edit"),
+        }
+    }
+
+    #[test]
+    fn i_on_non_markdown_is_plain_edit_not_live() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/foo.rs"),
+            text: "fn x() {}\n".to_string(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+        });
+        update(&mut s, Msg::Key(plain('i')));
+        match &s.open_file.as_ref().unwrap().edit {
+            EditState::Edit(b) => assert!(!b.is_live_preview()),
+            _ => panic!("expected Edit"),
+        }
     }
 
     #[test]
@@ -1709,12 +1765,51 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
-            preview_mode: false,
-            rendered_markdown: None,
         });
         update(&mut s, Msg::Key(plain('m')));
-        assert!(!s.open_file.as_ref().unwrap().preview_mode);
+        assert!(matches!(
+            s.open_file.as_ref().unwrap().edit,
+            EditState::View
+        ));
         assert!(s.status.is_some());
+    }
+
+    #[test]
+    fn live_preview_reparses_on_keystroke() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/reparse.md"),
+            text: "hello\n".to_string(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+        });
+        update(&mut s, Msg::Key(plain('m')));
+        let initial_blocks = if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
+            b.live_blocks.as_ref().unwrap().len()
+        } else {
+            panic!("expected Edit");
+        };
+        // Type a heading hash — should yield a new single block.
+        update(&mut s, Msg::Key(plain('#')));
+        update(&mut s, Msg::Key(plain(' ')));
+        update(&mut s, Msg::Key(plain('X')));
+        if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
+            let blocks = b.live_blocks.as_ref().unwrap();
+            assert!(
+                !blocks.is_empty(),
+                "blocks should remain populated after keystrokes"
+            );
+            // At minimum the parse ran — the block count should reflect the
+            // current buffer, which still has 1 block.
+            assert_eq!(blocks.len(), initial_blocks);
+        } else {
+            panic!("expected Edit");
+        }
     }
 
     #[test]
@@ -1730,8 +1825,6 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
-            preview_mode: false,
-            rendered_markdown: None,
         });
         update(
             &mut s,
@@ -1740,7 +1833,6 @@ mod tests {
                 result: Ok(LoadedFile {
                     text: String::new(),
                     highlighted: Arc::new(vec![Line::from("x")]),
-                    rendered_markdown: None,
                 }),
             },
         );
@@ -1759,7 +1851,6 @@ mod tests {
                 result: Ok(LoadedFile {
                     text: String::new(),
                     highlighted: Arc::new(vec![Line::from("x")]),
-                    rendered_markdown: None,
                 }),
             },
         );
@@ -1785,8 +1876,6 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
-            preview_mode: false,
-            rendered_markdown: None,
         }
     }
 

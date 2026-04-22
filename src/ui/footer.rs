@@ -39,13 +39,31 @@ pub fn render(state: &AppState, area: Rect, frame: &mut Frame) {
     // Edit / conflict / deleted hint strips override the normal footer.
     if let Some(open) = state.open_file.as_ref() {
         let edit_hints: Option<Vec<Span>> = match &open.edit {
-            EditState::Edit(b) => Some(vec![
-                hint("Ctrl-S", "save"),
-                sep(),
-                hint("Esc", if b.is_dirty() { "discard+exit" } else { "exit" }),
-                sep(),
-                hint("Ctrl-C×2", "quit"),
-            ]),
+            EditState::Edit(b) => {
+                let label = if b.is_live_preview() {
+                    if b.is_dirty() {
+                        "live preview · unsaved"
+                    } else {
+                        "live preview"
+                    }
+                } else if b.is_dirty() {
+                    "edit · unsaved"
+                } else {
+                    "edit"
+                };
+                Some(vec![
+                    Span::styled(
+                        format!(" {label} "),
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                    ),
+                    sep(),
+                    hint("Ctrl-S", "save"),
+                    sep(),
+                    hint("Esc", if b.is_dirty() { "discard+exit" } else { "exit" }),
+                    sep(),
+                    hint("Ctrl-C×2", "quit"),
+                ])
+            }
             EditState::Conflict { .. } => Some(vec![
                 hint("k", "keep mine"),
                 sep(),

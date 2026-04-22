@@ -9,6 +9,7 @@
 //! - Mermaid diagrams (M8 replaces `[mermaid]` placeholders with rendered PNGs).
 //! - Reveal-on-cursor editing (M6.5 / Level B).
 
+pub mod live;
 pub mod render;
 
-pub use render::render_markdown;
+pub use live::{LiveBlock, block_at_row, parse_blocks};
