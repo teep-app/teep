@@ -28,9 +28,23 @@ use ratatui::{
 
 use super::render;
 
-/// Fixed vertical budget (in terminal rows) reserved for each inline image
-/// block in V1. Dynamic sizing from pixel dims + cell metrics is deferred.
-pub const INLINE_IMAGE_ROWS: u16 = 12;
+/// Default vertical budget (in terminal rows) reserved for an inline image
+/// or mermaid block. Chosen empirically: 12 left wide flowchart diagrams
+/// height-constrained to a sliver; 24 lets the typical aspect ratio fill
+/// most of the pane width before the height limit kicks in.
+pub const INLINE_IMAGE_DEFAULT_ROWS: u16 = 24;
+
+/// Per-block upper bound — a portrait image shouldn't devour the whole
+/// preview. User-provided overrides are clamped to this ceiling.
+pub const INLINE_IMAGE_MAX_ROWS: u16 = 40;
+
+/// Floor on the reserved height so we never emit a zero-row block — that
+/// would collapse the visual anchor entirely and mess with cursor math.
+pub const INLINE_IMAGE_MIN_ROWS: u16 = 4;
+
+fn clamp_height(h: u16) -> u16 {
+    h.clamp(INLINE_IMAGE_MIN_ROWS, INLINE_IMAGE_MAX_ROWS)
+}
 
 #[derive(Clone, Debug)]
 pub struct LiveBlock {
@@ -114,21 +128,22 @@ pub fn parse_blocks(
         // Mermaid fences: only dispatched when `mmdc` is reachable — in
         // its absence the node falls through to the default cooked render,
         // which already emits a bordered "install mmdc to render" block.
-        let mermaid_source = detect_mermaid_fence(node);
-        let (image, mermaid, cooked) = if let Some(source) = mermaid_source
+        let mermaid_fence = detect_mermaid_fence(node);
+        let (image, mermaid, cooked) = if let Some((source, height_override)) = mermaid_fence
             && crate::mermaid::is_available()
         {
             let theme = crate::mermaid::DEFAULT_THEME;
             let hash = crate::mermaid::cache_key(&source, theme);
+            let height = clamp_height(height_override.unwrap_or(INLINE_IMAGE_DEFAULT_ROWS));
             if let Some(path) = crate::mermaid::cached_path(&hash) {
                 // Cache hit — render as a regular image block.
                 let alt = format!("mermaid:{}", &hash[..8.min(hash.len())]);
                 let image_ref = InlineImageRef {
                     path,
                     alt,
-                    height_cells: INLINE_IMAGE_ROWS,
+                    height_cells: height,
                 };
-                let cooked = vec![Line::from(""); INLINE_IMAGE_ROWS as usize];
+                let cooked = vec![Line::from(""); height as usize];
                 (Some(image_ref), None, cooked)
             } else {
                 // Cache miss — emit a placeholder and tag for scheduling.
@@ -144,10 +159,10 @@ pub fn parse_blocks(
                 .map(|(path, alt)| InlineImageRef {
                     path,
                     alt,
-                    height_cells: INLINE_IMAGE_ROWS,
+                    height_cells: INLINE_IMAGE_DEFAULT_ROWS,
                 });
             let cooked = if image_ref.is_some() {
-                vec![Line::from(""); INLINE_IMAGE_ROWS as usize]
+                vec![Line::from(""); INLINE_IMAGE_DEFAULT_ROWS as usize]
             } else {
                 render::render_block_to_lines(node)
             };
@@ -199,17 +214,36 @@ fn mermaid_placeholder(source: &str, failed: Option<&str>, rendering: bool) -> V
     lines
 }
 
-/// If `node` is a top-level mermaid code fence, return its source body.
-fn detect_mermaid_fence<'a>(node: &'a comrak::nodes::AstNode<'a>) -> Option<String> {
+/// If `node` is a top-level mermaid code fence, return its source body
+/// and any Teep-specific fence attributes (currently just `height=N`).
+///
+/// Info-string grammar we recognise:
+/// ```text
+/// mermaid                  → default height
+/// mermaid height=30        → override, clamped to [MIN, MAX] rows
+/// mermaid h=30             → same (short form)
+/// ```
+/// Unknown keys are ignored silently so the fence doesn't break when a
+/// later version of Teep adds more attributes.
+fn detect_mermaid_fence<'a>(node: &'a comrak::nodes::AstNode<'a>) -> Option<(String, Option<u16>)> {
     let data = node.data.borrow();
     match &data.value {
         NodeValue::CodeBlock(cb) => {
-            let lang = cb.info.split_whitespace().next().unwrap_or("");
-            if lang == "mermaid" {
-                Some(cb.literal.clone())
-            } else {
-                None
+            let mut tokens = cb.info.split_whitespace();
+            let lang = tokens.next().unwrap_or("");
+            if lang != "mermaid" {
+                return None;
             }
+            let mut height: Option<u16> = None;
+            for tok in tokens {
+                if let Some((k, v)) = tok.split_once('=')
+                    && matches!(k, "height" | "h")
+                    && let Ok(n) = v.parse::<u16>()
+                {
+                    height = Some(n);
+                }
+            }
+            Some((cb.literal.clone(), height))
         }
         _ => None,
     }
@@ -364,7 +398,7 @@ mod tests {
         let img = blocks[0].image.as_ref().expect("image block");
         assert_eq!(img.alt, "alt text");
         assert!(img.path.ends_with("a.png"));
-        assert_eq!(blocks[0].cooked.len(), INLINE_IMAGE_ROWS as usize);
+        assert_eq!(blocks[0].cooked.len(), INLINE_IMAGE_DEFAULT_ROWS as usize);
     }
 
     #[test]
@@ -418,5 +452,46 @@ mod tests {
         let text = format!("![]({})\n", p.display());
         let blocks = parse_blocks(&text, None, &HashSet::new(), &HashMap::new());
         assert!(blocks[0].image.is_some(), "absolute path should resolve");
+    }
+
+    /// Helper to parse a mermaid fence info string via a synthetic
+    /// `graph TD` body, bypassing the `mmdc` presence check. We call
+    /// `detect_mermaid_fence` directly to get at the height override.
+    fn detect_fence_from_text(text: &str) -> Option<(String, Option<u16>)> {
+        let arena = Arena::new();
+        let options = render::build_options();
+        let root = parse_document(&arena, text, &options);
+        root.children().next().and_then(detect_mermaid_fence)
+    }
+
+    #[test]
+    fn mermaid_info_string_without_attrs_has_no_override() {
+        let got = detect_fence_from_text("```mermaid\ngraph TD\nA-->B\n```\n");
+        assert_eq!(got.as_ref().map(|(_, h)| *h), Some(None));
+    }
+
+    #[test]
+    fn mermaid_info_string_height_attr_parses() {
+        let got = detect_fence_from_text("```mermaid height=30\ngraph TD\nA-->B\n```\n");
+        assert_eq!(got.as_ref().and_then(|(_, h)| *h), Some(30));
+    }
+
+    #[test]
+    fn mermaid_info_string_h_short_form_parses() {
+        let got = detect_fence_from_text("```mermaid h=18\ngraph TD\nA-->B\n```\n");
+        assert_eq!(got.as_ref().and_then(|(_, h)| *h), Some(18));
+    }
+
+    #[test]
+    fn mermaid_info_string_unknown_attrs_ignored() {
+        let got = detect_fence_from_text("```mermaid theme=forest height=20 mystery=?\n\n```\n");
+        assert_eq!(got.as_ref().and_then(|(_, h)| *h), Some(20));
+    }
+
+    #[test]
+    fn clamp_height_bounds() {
+        assert_eq!(clamp_height(0), INLINE_IMAGE_MIN_ROWS);
+        assert_eq!(clamp_height(999), INLINE_IMAGE_MAX_ROWS);
+        assert_eq!(clamp_height(20), 20);
     }
 }

@@ -246,7 +246,7 @@ fn render_edit(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
 /// blocks render in their source position so cursor coordinates stay
 /// honest when the cursor is parked on an empty line.
 ///
-/// Inline images: sole-image paragraphs reserve `INLINE_IMAGE_ROWS` blank
+/// Inline images: sole-image paragraphs reserve `INLINE_IMAGE_DEFAULT_ROWS` blank
 /// lines in the text pass, then a second pass overlays the actual
 /// `StatefulImage` widget on that rect. When the cursor is on an image
 /// block, it falls into the raw-source branch and no overlay happens —
