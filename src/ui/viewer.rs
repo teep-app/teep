@@ -6,7 +6,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::app::{AppState, EditState, Focus, OpenFile};
+use crate::app::{AppState, EditState, Focus, InlineImageState, OpenFile};
+use crate::markdown::InlineImageRef;
 
 pub fn render(state: &AppState, area: Rect, frame: &mut Frame) {
     let chunks = Layout::default()
@@ -244,7 +245,18 @@ fn render_edit(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
 /// `**`, `|`); every other block renders cooked. Blank lines between
 /// blocks render in their source position so cursor coordinates stay
 /// honest when the cursor is parked on an empty line.
+///
+/// Inline images: sole-image paragraphs reserve `INLINE_IMAGE_ROWS` blank
+/// lines in the text pass, then a second pass overlays the actual
+/// `StatefulImage` widget on that rect. When the cursor is on an image
+/// block, it falls into the raw-source branch and no overlay happens —
+/// consistent with Level-B reveal-on-cursor.
 fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
+    struct ImageOverlay<'a> {
+        visual_start: usize,
+        image: &'a InlineImageRef,
+    }
+
     let blocks = buffer
         .live_blocks
         .as_ref()
@@ -256,6 +268,7 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
 
     let mut visual: Vec<Line<'static>> = Vec::new();
     let mut cursor_visual: Option<(usize, usize)> = None;
+    let mut image_overlays: Vec<ImageOverlay> = Vec::new();
 
     let mut row = 0;
     while row < total_rows {
@@ -273,8 +286,15 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
                 }
             } else {
                 // Cooked — emit the pre-rendered block lines in place.
+                let block_visual_start = visual.len();
                 for cooked in &block.cooked {
                     visual.push(cooked.clone());
+                }
+                if let Some(img) = &block.image {
+                    image_overlays.push(ImageOverlay {
+                        visual_start: block_visual_start,
+                        image: img,
+                    });
                 }
             }
             row = block.source_end;
@@ -305,6 +325,59 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
     let end = (start + height).min(total);
     let body: Vec<Line> = visual[start..end].to_vec();
     frame.render_widget(Paragraph::new(body), area);
+
+    // Second pass: overlay each image block whose reserved rect intersects
+    // the viewport. Lookups against the decode cache — render the actual
+    // picture, a decoding spinner, or an error hint accordingly.
+    for overlay in &image_overlays {
+        let block_end_visual = overlay.visual_start + overlay.image.height_cells as usize;
+        if overlay.visual_start >= end || block_end_visual <= start {
+            continue;
+        }
+        let clipped_start = overlay.visual_start.max(start);
+        let clipped_end = block_end_visual.min(end);
+        let rect = Rect {
+            x: area.x,
+            y: area.y + (clipped_start - start) as u16,
+            width: area.width,
+            height: (clipped_end - clipped_start) as u16,
+        };
+        match buffer.inline_images.get(&overlay.image.path) {
+            Some(InlineImageState::Loaded(cell)) => {
+                let mut protocol = cell.borrow_mut();
+                let widget = ratatui_image::StatefulImage::<
+                    ratatui_image::protocol::StatefulProtocol,
+                >::new();
+                frame.render_stateful_widget(widget, rect, &mut *protocol);
+            }
+            Some(InlineImageState::Loading) => {
+                let name = overlay
+                    .image
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| overlay.image.path.display().to_string());
+                let p = Paragraph::new(Line::from(Span::styled(
+                    format!("  decoding {name}…"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                frame.render_widget(p, rect);
+            }
+            Some(InlineImageState::Failed(e)) => {
+                let label = if overlay.image.alt.is_empty() {
+                    format!("  [image · {e}]")
+                } else {
+                    format!("  [image: {} · {}]", overlay.image.alt, e)
+                };
+                let p = Paragraph::new(Line::from(Span::styled(
+                    label,
+                    Style::default().fg(Color::Red),
+                )));
+                frame.render_widget(p, rect);
+            }
+            None => {}
+        }
+    }
 
     if let Some((vrow, vcol)) = cursor_visual
         && vrow >= start

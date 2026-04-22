@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     io::Stdout,
     path::{Path, PathBuf},
     sync::Arc,
@@ -167,6 +168,24 @@ pub struct EditBuffer {
     /// `Some(blocks)` when this buffer is a markdown file in Live Preview
     /// mode (M6.5). `None` for plain-text editing of non-markdown files.
     pub live_blocks: Option<Vec<LiveBlock>>,
+    /// Parent directory of the markdown file; used to resolve relative
+    /// image URLs. `None` for non-markdown buffers and for unrooted scratch.
+    pub markdown_dir: Option<PathBuf>,
+    /// Per-path cache of inline image decode state. Populated lazily as
+    /// `![](path)` references appear in the buffer.
+    pub inline_images: HashMap<PathBuf, InlineImageState>,
+}
+
+/// State of an inline markdown image's decode.
+pub enum InlineImageState {
+    /// Decode is in flight; the runtime will deliver `Msg::InlineImageLoaded`.
+    Loading,
+    /// Decoded and wrapped in a `StatefulProtocol` ready to render. `RefCell`
+    /// because `StatefulImage`'s render call needs `&mut protocol` but our
+    /// render path threads only `&AppState`.
+    Loaded(RefCell<StatefulProtocol>),
+    /// Decode failed; displayed inline as `[image: alt · <error>]`.
+    Failed(String),
 }
 
 impl EditBuffer {
@@ -176,19 +195,35 @@ impl EditBuffer {
             textarea: TextArea::new(lines),
             base_text: initial.to_string(),
             live_blocks: None,
+            markdown_dir: None,
+            inline_images: HashMap::new(),
         }
     }
 
     /// Construct an edit buffer that starts in Live Preview mode
     /// (markdown blocks parsed and ready to be rendered cooked/raw).
-    pub fn new_live(initial: &str) -> Self {
-        let blocks = markdown::parse_blocks(initial);
+    /// Returns the buffer and the list of image paths that need decoding.
+    pub fn new_live(initial: &str, markdown_dir: Option<PathBuf>) -> (Self, Vec<PathBuf>) {
+        let blocks = markdown::parse_blocks(initial, markdown_dir.as_deref());
         let lines: Vec<String> = initial.split('\n').map(|s| s.to_string()).collect();
-        Self {
+        let mut inline_images: HashMap<PathBuf, InlineImageState> = HashMap::new();
+        let mut needed: Vec<PathBuf> = Vec::new();
+        for b in &blocks {
+            if let Some(img) = &b.image
+                && !inline_images.contains_key(&img.path)
+            {
+                inline_images.insert(img.path.clone(), InlineImageState::Loading);
+                needed.push(img.path.clone());
+            }
+        }
+        let buffer = Self {
             textarea: TextArea::new(lines),
             base_text: initial.to_string(),
             live_blocks: Some(blocks),
-        }
+            markdown_dir,
+            inline_images,
+        };
+        (buffer, needed)
     }
 
     pub fn current_text(&self) -> String {
@@ -199,13 +234,28 @@ impl EditBuffer {
         self.current_text() != self.base_text
     }
 
-    /// Re-parse the buffer's current text into live-preview blocks.
-    /// Called after any mutation when in Live Preview mode.
-    pub fn refresh_live_blocks(&mut self) {
-        if self.live_blocks.is_some() {
-            let text = self.current_text();
-            self.live_blocks = Some(markdown::parse_blocks(&text));
+    /// Re-parse the buffer's current text into live-preview blocks. Returns
+    /// the set of image paths referenced for the first time (each inserted
+    /// into `inline_images` as `Loading` before the list is returned, so the
+    /// caller is responsible for emitting `Cmd::LoadInlineImage` for each).
+    pub fn refresh_live_blocks(&mut self) -> Vec<PathBuf> {
+        if self.live_blocks.is_none() {
+            return Vec::new();
         }
+        let text = self.current_text();
+        let blocks = markdown::parse_blocks(&text, self.markdown_dir.as_deref());
+        let mut needed: Vec<PathBuf> = Vec::new();
+        for b in &blocks {
+            if let Some(img) = &b.image
+                && !self.inline_images.contains_key(&img.path)
+            {
+                self.inline_images
+                    .insert(img.path.clone(), InlineImageState::Loading);
+                needed.push(img.path.clone());
+            }
+        }
+        self.live_blocks = Some(blocks);
+        needed
     }
 
     pub fn is_live_preview(&self) -> bool {
@@ -236,6 +286,14 @@ pub enum Msg {
         path: PathBuf,
         result: Result<image::DynamicImage, String>,
     },
+    /// An inline markdown image decode completed. `buffer_path` is the
+    /// markdown file the request originated from; the handler drops the
+    /// result if that file is no longer open in Live Preview.
+    InlineImageLoaded {
+        buffer_path: PathBuf,
+        image_path: PathBuf,
+        result: Result<image::DynamicImage, String>,
+    },
     TreeRebuilt(tree::Node),
     GitRefreshed(Result<GitSnapshot, String>),
     DiffReady {
@@ -249,11 +307,20 @@ pub enum Msg {
 #[derive(Debug)]
 pub enum Cmd {
     LoadFile(PathBuf),
-    SaveFile { path: PathBuf, content: String },
+    SaveFile {
+        path: PathBuf,
+        content: String,
+    },
     RebuildTree,
     RefreshGit,
     ComputeDiff(PathBuf),
     ReRoot(PathBuf),
+    /// Decode an inline markdown image. `buffer_path` identifies the
+    /// markdown file the request came from (echoed back on the response).
+    LoadInlineImage {
+        buffer_path: PathBuf,
+        image_path: PathBuf,
+    },
 }
 
 const CTRL_C_QUIT_WINDOW: Duration = Duration::from_millis(1000);
@@ -272,6 +339,11 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
         Msg::FileLoaded { path, result } => handle_file_loaded(state, path, result),
         Msg::FileSaved { path, result } => handle_file_saved(state, path, result),
         Msg::ImageLoaded { path, result } => handle_image_loaded(state, path, result),
+        Msg::InlineImageLoaded {
+            buffer_path,
+            image_path,
+            result,
+        } => handle_inline_image_loaded(state, buffer_path, image_path, result),
         Msg::TreeRebuilt(node) => state.tree.graft(node),
         Msg::GitRefreshed(result) => handle_git_refreshed(state, result),
         Msg::DiffReady { path, result } => handle_diff_ready(state, path, result),
@@ -362,10 +434,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
             set_status(state, "refreshing tree...".to_string());
         }
         (KeyCode::Char('d'), _) => toggle_diff(state, cmds),
-        (KeyCode::Char('m'), _) => m_key(state),
+        (KeyCode::Char('m'), _) => m_key(state, cmds),
         (KeyCode::Char('g'), _) => open_git_status(state),
         (KeyCode::Char('b'), _) => open_worktree_switcher(state),
-        (KeyCode::Char('i'), _) | (KeyCode::Char('e'), _) => enter_edit_mode(state),
+        (KeyCode::Char('i'), _) | (KeyCode::Char('e'), _) => enter_edit_mode(state, cmds),
         _ => match state.focus {
             Focus::Tree => handle_tree_key(state, key, cmds),
             Focus::Viewer => handle_viewer_key(state, key),
@@ -373,7 +445,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
     }
 }
 
-fn enter_edit_mode(state: &mut AppState) {
+fn enter_edit_mode(state: &mut AppState, cmds: &mut Vec<Cmd>) {
     let Some(open) = state.open_file.as_mut() else {
         set_status(state, "no file open".to_string());
         return;
@@ -394,8 +466,17 @@ fn enter_edit_mode(state: &mut AppState) {
     }
     open.diff_mode = false;
     // Markdown files enter Live Preview; everything else gets plain text edit.
+    let buffer_path = open.path.clone();
     let buffer = if is_markdown_path(&open.path) {
-        EditBuffer::new_live(&open.text)
+        let markdown_dir = open.path.parent().map(|p| p.to_path_buf());
+        let (buffer, needed) = EditBuffer::new_live(&open.text, markdown_dir);
+        for image_path in needed {
+            cmds.push(Cmd::LoadInlineImage {
+                buffer_path: buffer_path.clone(),
+                image_path,
+            });
+        }
+        buffer
     } else {
         EditBuffer::new(&open.text)
     };
@@ -424,15 +505,21 @@ fn handle_edit_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
         return;
     }
     // Everything else flows into the text area. Re-parse Live Preview
-    // blocks after any mutation.
+    // blocks after any mutation and schedule decodes for any new images.
     let Some(open) = state.open_file.as_mut() else {
         return;
     };
+    let buffer_path = open.path.clone();
     if let EditState::Edit(buffer) = &mut open.edit {
         let input: Input = Input::from(key);
         let mutated = buffer.textarea.input(input);
         if mutated && buffer.is_live_preview() {
-            buffer.refresh_live_blocks();
+            for image_path in buffer.refresh_live_blocks() {
+                cmds.push(Cmd::LoadInlineImage {
+                    buffer_path: buffer_path.clone(),
+                    image_path,
+                });
+            }
         }
     }
 }
@@ -553,6 +640,34 @@ fn handle_image_loaded(
     }
 }
 
+fn handle_inline_image_loaded(
+    state: &mut AppState,
+    buffer_path: PathBuf,
+    image_path: PathBuf,
+    result: Result<image::DynamicImage, String>,
+) {
+    // Drop results that don't match a live Live-Preview buffer for the
+    // requested file. User closed the file, switched to plain-text edit,
+    // re-rooted, or edited the reference away — no state mutation.
+    let Some(open) = state.open_file.as_mut() else {
+        return;
+    };
+    if open.path != buffer_path {
+        return;
+    }
+    let EditState::Edit(buffer) = &mut open.edit else {
+        return;
+    };
+    if !buffer.inline_images.contains_key(&image_path) {
+        return;
+    }
+    let new_state = match result {
+        Ok(img) => InlineImageState::Loaded(RefCell::new(crate::image::new_protocol(img))),
+        Err(e) => InlineImageState::Failed(e),
+    };
+    buffer.inline_images.insert(image_path, new_state);
+}
+
 fn handle_file_saved(state: &mut AppState, path: PathBuf, result: Result<(), String>) {
     match result {
         Ok(()) => set_status(state, format!("saved {}", path.display())),
@@ -566,7 +681,7 @@ fn handle_file_saved(state: &mut AppState, path: PathBuf, result: Result<(), Str
 
 /// `m` on a markdown file enters Live Preview (unified with `i`/`e`).
 /// On non-markdown files it just toasts — there's nothing to preview.
-fn m_key(state: &mut AppState) {
+fn m_key(state: &mut AppState, cmds: &mut Vec<Cmd>) {
     let Some(open) = state.open_file.as_ref() else {
         set_status(state, "no file open".to_string());
         return;
@@ -575,7 +690,7 @@ fn m_key(state: &mut AppState) {
         set_status(state, "preview is only for markdown files".to_string());
         return;
     }
-    enter_edit_mode(state);
+    enter_edit_mode(state, cmds);
 }
 
 fn toggle_diff(state: &mut AppState, cmds: &mut Vec<Cmd>) {
@@ -2130,5 +2245,107 @@ mod tests {
         s.status = Some(("hi".to_string(), Instant::now() - Duration::from_secs(10)));
         update(&mut s, Msg::Tick);
         assert!(s.status.is_none());
+    }
+
+    #[test]
+    fn inline_image_failed_transitions_loading_to_failed() {
+        let mut s = fixture();
+        let buffer_path = PathBuf::from("/tmp/some.md");
+        s.open_file = Some(open_file_with_text("![](a.png)\n", buffer_path.clone()));
+        // Manually put the buffer in Live Preview with one Loading entry,
+        // avoiding the real parser (which would need a real on-disk image).
+        let (mut buf, _) = EditBuffer::new_live("![](a.png)\n", None);
+        let image_path = PathBuf::from("/tmp/a.png");
+        buf.inline_images
+            .insert(image_path.clone(), InlineImageState::Loading);
+        s.open_file.as_mut().unwrap().edit = EditState::Edit(buf);
+
+        update(
+            &mut s,
+            Msg::InlineImageLoaded {
+                buffer_path,
+                image_path: image_path.clone(),
+                result: Err("boom".to_string()),
+            },
+        );
+
+        match &s.open_file.as_ref().unwrap().edit {
+            EditState::Edit(b) => match b.inline_images.get(&image_path) {
+                Some(InlineImageState::Failed(msg)) => assert_eq!(msg, "boom"),
+                _ => panic!("expected Failed"),
+            },
+            _ => panic!("expected Edit"),
+        }
+    }
+
+    #[test]
+    fn inline_image_result_dropped_when_file_no_longer_open() {
+        let mut s = fixture();
+        // No open_file at all — result must be silently discarded, no panic.
+        update(
+            &mut s,
+            Msg::InlineImageLoaded {
+                buffer_path: PathBuf::from("/tmp/gone.md"),
+                image_path: PathBuf::from("/tmp/a.png"),
+                result: Err("ignored".to_string()),
+            },
+        );
+        assert!(s.open_file.is_none());
+    }
+
+    #[test]
+    fn inline_image_result_dropped_when_buffer_path_mismatches() {
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text(
+            "![](a.png)\n",
+            PathBuf::from("/tmp/current.md"),
+        ));
+        let (mut buf, _) = EditBuffer::new_live("![](a.png)\n", None);
+        let image_path = PathBuf::from("/tmp/a.png");
+        buf.inline_images
+            .insert(image_path.clone(), InlineImageState::Loading);
+        s.open_file.as_mut().unwrap().edit = EditState::Edit(buf);
+
+        update(
+            &mut s,
+            Msg::InlineImageLoaded {
+                buffer_path: PathBuf::from("/tmp/different.md"),
+                image_path: image_path.clone(),
+                result: Err("ignored".to_string()),
+            },
+        );
+
+        match &s.open_file.as_ref().unwrap().edit {
+            EditState::Edit(b) => assert!(
+                matches!(
+                    b.inline_images.get(&image_path),
+                    Some(InlineImageState::Loading)
+                ),
+                "mismatched buffer_path must not mutate state"
+            ),
+            _ => panic!("expected Edit"),
+        }
+    }
+
+    #[test]
+    fn entering_live_preview_emits_load_inline_image_cmd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let md_path = tmp.path().join("doc.md");
+        let png_path = tmp.path().join("pic.png");
+        std::fs::write(&png_path, [0x89u8, b'P', b'N', b'G']).unwrap();
+        std::fs::write(&md_path, "![](pic.png)\n").unwrap();
+
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("![](pic.png)\n", md_path.clone()));
+        let cmds = update(&mut s, Msg::Key(plain('i')));
+
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::LoadInlineImage { image_path, .. }
+                    if image_path.file_name().and_then(|n| n.to_str()) == Some("pic.png")
+            )),
+            "expected Cmd::LoadInlineImage for pic.png, got {cmds:?}"
+        );
     }
 }

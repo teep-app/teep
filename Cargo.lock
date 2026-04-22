@@ -2001,6 +2001,7 @@ dependencies = [
  "serde",
  "similar",
  "syntect",
+ "tempfile",
  "textwrap",
  "thiserror 2.0.18",
  "tokio",

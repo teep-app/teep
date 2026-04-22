@@ -441,7 +441,7 @@ fn render_inlines<'a>(node: &'a AstNode<'a>, spans: &mut Vec<Span<'static>>, bas
     }
 }
 
-fn collect_text<'a>(node: &'a AstNode<'a>) -> String {
+pub(crate) fn collect_text<'a>(node: &'a AstNode<'a>) -> String {
     let mut out = String::new();
     for child in node.children() {
         let data = child.data.borrow();

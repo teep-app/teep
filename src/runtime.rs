@@ -33,6 +33,10 @@ impl Runtime {
                 // observes this and returns SessionOutcome::Reroot.
                 let _ = self.tx.send(Msg::ReRootRequested(new_root));
             }
+            Cmd::LoadInlineImage {
+                buffer_path,
+                image_path,
+            } => self.spawn_load_inline_image(buffer_path, image_path),
         }
     }
 
@@ -120,6 +124,26 @@ impl Runtime {
                 Err(e) => Err(format!("decode task panicked: {e}")),
             };
             let _ = tx.send(Msg::ImageLoaded { path, result });
+        });
+    }
+
+    fn spawn_load_inline_image(&self, buffer_path: PathBuf, image_path: PathBuf) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            debug!(?buffer_path, ?image_path, "decoding inline markdown image");
+            let path_for_task = image_path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || image::decode_image(&path_for_task)).await;
+            let result = match result {
+                Ok(Ok(img)) => Ok(img),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("inline image decode task panicked: {e}")),
+            };
+            let _ = tx.send(Msg::InlineImageLoaded {
+                buffer_path,
+                image_path,
+                result,
+            });
         });
     }
 }

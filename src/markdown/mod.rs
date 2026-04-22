@@ -12,4 +12,4 @@
 pub mod live;
 pub mod render;
 
-pub use live::{LiveBlock, block_at_row, parse_blocks};
+pub use live::{InlineImageRef, LiveBlock, block_at_row, parse_blocks};
