@@ -210,8 +210,9 @@ fn render_edit(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
 
 /// Render a markdown buffer in Live Preview mode: the block whose source
 /// range contains the cursor renders as raw text (so you can see `##`,
-/// `**`, `|`); every other block renders cooked. Cursor is placed on the
-/// raw block; the mode is always editable.
+/// `**`, `|`); every other block renders cooked. Blank lines between
+/// blocks render in their source position so cursor coordinates stay
+/// honest when the cursor is parked on an empty line.
 fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
     let blocks = buffer
         .live_blocks
@@ -219,39 +220,46 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
         .expect("called with live blocks");
     let (cursor_row, cursor_col) = buffer.textarea.cursor();
     let current_block_idx = crate::markdown::block_at_row(blocks, cursor_row);
+    let lines = buffer.textarea.lines();
+    let total_rows = lines.len();
 
     let mut visual: Vec<Line<'static>> = Vec::new();
     let mut cursor_visual: Option<(usize, usize)> = None;
 
-    for (i, block) in blocks.iter().enumerate() {
-        if i > 0 {
-            visual.push(Line::from(""));
-        }
-        if Some(i) == current_block_idx {
-            // Raw form: render the buffer's source lines for this block range.
-            for src_row in block.source_start..block.source_end {
-                if let Some(line_text) = buffer.textarea.lines().get(src_row) {
-                    if src_row == cursor_row {
-                        cursor_visual = Some((visual.len(), cursor_col));
+    let mut row = 0;
+    while row < total_rows {
+        if let Some(bi) = crate::markdown::block_at_row(blocks, row) {
+            let block = &blocks[bi];
+            if Some(bi) == current_block_idx {
+                // Raw — one visual line per source line, cursor tracked.
+                for src_row in block.source_start..block.source_end {
+                    if let Some(line_text) = lines.get(src_row) {
+                        if src_row == cursor_row {
+                            cursor_visual = Some((visual.len(), cursor_col));
+                        }
+                        visual.push(Line::from(Span::raw(line_text.clone())));
                     }
-                    visual.push(Line::from(Span::raw(line_text.clone())));
+                }
+            } else {
+                // Cooked — emit the pre-rendered block lines in place.
+                for cooked in &block.cooked {
+                    visual.push(cooked.clone());
                 }
             }
+            row = block.source_end;
         } else {
-            for cooked in &block.cooked {
-                visual.push(cooked.clone());
+            // Inter-block or trailing blank line. Render empty, but track the
+            // cursor if it's parked here so it sits where the user expects.
+            if row == cursor_row {
+                cursor_visual = Some((visual.len(), cursor_col));
             }
+            visual.push(Line::from(""));
+            row += 1;
         }
     }
 
-    // If the cursor is on a line the parser skipped (blank between blocks),
-    // show that line raw so the cursor has somewhere to sit.
-    if cursor_visual.is_none()
-        && let Some(line_text) = buffer.textarea.lines().get(cursor_row)
-    {
-        cursor_visual = Some((visual.len(), cursor_col));
-        visual.push(Line::from(Span::raw(line_text.clone())));
-    }
+    // If the cursor is somehow past the last row (defensive — shouldn't
+    // happen, tui-textarea keeps the cursor in range), leave it alone.
 
     // Scroll so the cursor row is inside the viewport.
     let height = area.height as usize;
