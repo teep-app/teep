@@ -6,6 +6,7 @@ mod event;
 mod finder;
 mod fs_watch;
 mod git;
+mod image;
 mod markdown;
 mod runtime;
 mod syntax;

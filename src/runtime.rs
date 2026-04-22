@@ -5,7 +5,7 @@ use tracing::{debug, warn};
 
 use crate::{
     app::{Cmd, LoadedFile, Msg},
-    git, syntax, tree,
+    git, image, syntax, tree,
 };
 
 /// Executes side-effecting `Cmd`s emitted by `update`. Results come back as
@@ -92,6 +92,11 @@ impl Runtime {
     }
 
     fn spawn_load_file(&self, path: PathBuf) {
+        // Image files skip the syntect/text pipeline entirely.
+        if image::is_image_path(&path) {
+            self.spawn_load_image(path);
+            return;
+        }
         let tx = self.tx.clone();
         tokio::spawn(async move {
             debug!(?path, "loading file");
@@ -99,6 +104,22 @@ impl Runtime {
             if tx.send(Msg::FileLoaded { path, result }).is_err() {
                 warn!("event receiver dropped while loading file");
             }
+        });
+    }
+
+    fn spawn_load_image(&self, path: PathBuf) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            debug!(?path, "decoding image");
+            let path_for_task = path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || image::decode_image(&path_for_task)).await;
+            let result = match result {
+                Ok(Ok(img)) => Ok(img),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("decode task panicked: {e}")),
+            };
+            let _ = tx.send(Msg::ImageLoaded { path, result });
         });
     }
 }

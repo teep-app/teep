@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     io::Stdout,
     path::{Path, PathBuf},
     sync::Arc,
@@ -8,6 +9,7 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect, text::Line};
+use ratatui_image::protocol::StatefulProtocol;
 use tui_textarea::{Input, TextArea};
 
 use crate::{
@@ -129,6 +131,12 @@ pub struct OpenFile {
 
     // M5: edit state (M6.5: markdown files get EditState::Edit with live_blocks populated)
     pub edit: EditState,
+
+    // M7: image files — when Some, the viewer renders an image instead of text.
+    // RefCell because ratatui-image's StatefulProtocol needs &mut during render,
+    // but our render path threads only `&AppState` down to the widget layer.
+    pub image: Option<RefCell<StatefulProtocol>>,
+    pub image_error: Option<String>,
 }
 
 /// True for file extensions we treat as markdown for preview purposes.
@@ -224,6 +232,10 @@ pub enum Msg {
         path: PathBuf,
         result: Result<(), String>,
     },
+    ImageLoaded {
+        path: PathBuf,
+        result: Result<image::DynamicImage, String>,
+    },
     TreeRebuilt(tree::Node),
     GitRefreshed(Result<GitSnapshot, String>),
     DiffReady {
@@ -259,6 +271,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
         Msg::FsChanged(paths) => handle_fs_changed(state, paths, &mut cmds),
         Msg::FileLoaded { path, result } => handle_file_loaded(state, path, result),
         Msg::FileSaved { path, result } => handle_file_saved(state, path, result),
+        Msg::ImageLoaded { path, result } => handle_image_loaded(state, path, result),
         Msg::TreeRebuilt(node) => state.tree.graft(node),
         Msg::GitRefreshed(result) => handle_git_refreshed(state, result),
         Msg::DiffReady { path, result } => handle_diff_ready(state, path, result),
@@ -367,6 +380,13 @@ fn enter_edit_mode(state: &mut AppState) {
     };
     if open.error.is_some() {
         set_status(state, "cannot edit: file has errors".to_string());
+        return;
+    }
+    if open.image.is_some() || open.image_error.is_some() {
+        set_status(
+            state,
+            "image files aren't editable — open in a real editor".to_string(),
+        );
         return;
     }
     if !matches!(open.edit, EditState::View) {
@@ -486,6 +506,50 @@ fn handle_deleted_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) 
             set_status(state, "closed".to_string());
         }
         _ => {}
+    }
+}
+
+fn handle_image_loaded(
+    state: &mut AppState,
+    path: PathBuf,
+    result: Result<image::DynamicImage, String>,
+) {
+    state.changes.mark_seen(&path);
+    match result {
+        Ok(img) => {
+            let protocol = crate::image::new_protocol(img);
+            state.open_file = Some(OpenFile {
+                path,
+                text: String::new(),
+                highlighted: Arc::new(Vec::new()),
+                scroll: 0,
+                error: None,
+                diff_mode: false,
+                diff: None,
+                diff_error: None,
+                edit: EditState::View,
+                image: Some(RefCell::new(protocol)),
+                image_error: None,
+            });
+            state.focus = Focus::Viewer;
+        }
+        Err(e) => {
+            let msg = format!("image decode failed: {e}");
+            state.open_file = Some(OpenFile {
+                path,
+                text: String::new(),
+                highlighted: Arc::new(Vec::new()),
+                scroll: 0,
+                error: None,
+                diff_mode: false,
+                diff: None,
+                diff_error: None,
+                edit: EditState::View,
+                image: None,
+                image_error: Some(msg.clone()),
+            });
+            set_status(state, msg);
+        }
     }
 }
 
@@ -912,6 +976,8 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff: None,
                 diff_error: None,
                 edit: EditState::View,
+                image: None,
+                image_error: None,
             });
             state.focus = Focus::Viewer;
             if is_reload {
@@ -930,6 +996,8 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff: None,
                 diff_error: None,
                 edit: EditState::View,
+                image: None,
+                image_error: None,
             });
             set_status(state, msg);
         }
@@ -1059,6 +1127,16 @@ async fn run_session(
     let mut events = EventLoop::new();
     let runtime = Runtime::new(events.sender(), root.to_path_buf());
     let _fs_watcher = fs_watch::spawn(root.to_path_buf(), events.sender())?;
+
+    // Tmux passthrough nag: if we're inside tmux, images typically silently
+    // fail unless allow-passthrough is enabled. Do this once per session.
+    if std::env::var("TMUX").is_ok() {
+        set_status(
+            &mut state,
+            "tmux detected — run `tmux set -g allow-passthrough on` for image rendering"
+                .to_string(),
+        );
+    }
 
     while !state.quit && state.reroot_to.is_none() {
         terminal.draw(|f| crate::ui::view(&mut state, f))?;
@@ -1190,6 +1268,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         let cmds = update(&mut s, Msg::FsChanged(vec![tmpfile.clone()]));
         assert_eq!(s.changes.entries().len(), 1);
@@ -1322,6 +1402,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         s.mouse_layout = MouseLayout {
             viewer: Rect {
@@ -1414,6 +1496,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         update(
             &mut s,
@@ -1569,6 +1653,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         // First press: enter diff mode + request computation.
         let cmds = update(&mut s, Msg::Key(plain('d')));
@@ -1696,6 +1782,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         update(&mut s, Msg::Key(plain('m')));
         match &s.open_file.as_ref().unwrap().edit {
@@ -1723,6 +1811,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         update(&mut s, Msg::Key(plain('i')));
         match &s.open_file.as_ref().unwrap().edit {
@@ -1744,6 +1834,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         update(&mut s, Msg::Key(plain('i')));
         match &s.open_file.as_ref().unwrap().edit {
@@ -1765,6 +1857,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         update(&mut s, Msg::Key(plain('m')));
         assert!(matches!(
@@ -1787,6 +1881,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         update(&mut s, Msg::Key(plain('m')));
         let initial_blocks = if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
@@ -1825,6 +1921,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         });
         update(
             &mut s,
@@ -1876,6 +1974,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            image: None,
+            image_error: None,
         }
     }
 

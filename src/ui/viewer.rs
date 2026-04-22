@@ -24,6 +24,10 @@ fn render_header(state: &AppState, area: Rect, frame: &mut Frame) {
             let relative = f.path.strip_prefix(&state.root).unwrap_or(f.path.as_path());
             let marker = if f.error.is_some() {
                 " [error]"
+            } else if f.image.is_some() {
+                " [image]"
+            } else if f.image_error.is_some() {
+                " [image · failed]"
             } else if matches!(f.edit, EditState::Deleted { .. }) {
                 " [file removed]"
             } else if let EditState::Edit(b) = &f.edit {
@@ -88,6 +92,20 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
             Style::default().fg(Color::Red),
         )));
         frame.render_widget(p, inner);
+        return;
+    }
+
+    // M7: image files render as pictures, not as text.
+    if let Some(err) = &open.image_error {
+        let p = Paragraph::new(Line::from(Span::styled(
+            format!("could not decode image: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+        frame.render_widget(p, inner);
+        return;
+    }
+    if let Some(image_cell) = &open.image {
+        render_image(image_cell, inner, frame);
         return;
     }
 
@@ -198,6 +216,19 @@ fn render_diff(open: &OpenFile, area: Rect, frame: &mut Frame) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_image(
+    image_cell: &std::cell::RefCell<ratatui_image::protocol::StatefulProtocol>,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    // `StatefulImage<T>` is generic over the protocol kind; we use
+    // `StatefulProtocol`. We keep the protocol in a `RefCell` because our
+    // render path has only `&AppState`.
+    let mut protocol = image_cell.borrow_mut();
+    let widget = ratatui_image::StatefulImage::<ratatui_image::protocol::StatefulProtocol>::new();
+    frame.render_stateful_widget(widget, area, &mut *protocol);
 }
 
 fn render_edit(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
