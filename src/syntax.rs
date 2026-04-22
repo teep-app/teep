@@ -44,6 +44,20 @@ pub fn highlight_file(text: &str, path: &Path) -> Vec<Line<'static>> {
         })
         .unwrap_or_else(|| ss.find_syntax_plain_text());
 
+    run_highlight(text, syntax)
+}
+
+/// Highlight a code fence body given an info-string token (e.g. "rust", "ts").
+pub fn highlight_code(text: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+    let ss = syntax_set();
+    let syntax = lang
+        .and_then(|t| ss.find_syntax_by_token(t))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    run_highlight(text, syntax)
+}
+
+fn run_highlight(text: &str, syntax: &syntect::parsing::SyntaxReference) -> Vec<Line<'static>> {
+    let ss = syntax_set();
     let mut highlighter = HighlightLines::new(syntax, theme());
     let mut out = Vec::new();
     for line in LinesWithEndings::from(text) {

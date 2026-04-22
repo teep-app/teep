@@ -34,6 +34,8 @@ fn render_header(state: &AppState, area: Rect, frame: &mut Frame) {
                 }
             } else if matches!(f.edit, EditState::Conflict { .. }) {
                 " [edit · conflict]"
+            } else if f.preview_mode {
+                " [markdown preview]"
             } else if f.diff_mode {
                 " [diff vs HEAD]"
             } else {
@@ -106,6 +108,11 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
         EditState::View => {}
     }
 
+    if open.preview_mode {
+        render_preview(open, inner, frame);
+        return;
+    }
+
     if open.diff_mode {
         render_diff(open, inner, frame);
         return;
@@ -145,6 +152,23 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
 
     let body: Vec<Line> = open.highlighted[start..end].to_vec();
     frame.render_widget(Paragraph::new(body), content_area);
+}
+
+fn render_preview(open: &OpenFile, area: Rect, frame: &mut Frame) {
+    let Some(md) = &open.rendered_markdown else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " (preview not available — loading...)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(p, area);
+        return;
+    };
+    let total = md.len();
+    let start = open.scroll.min(total);
+    let end = (start + area.height as usize).min(total);
+    let body: Vec<Line> = md[start..end].to_vec();
+    let p = Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(p, area);
 }
 
 fn render_diff(open: &OpenFile, area: Rect, frame: &mut Frame) {

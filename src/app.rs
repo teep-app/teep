@@ -128,6 +128,18 @@ pub struct OpenFile {
 
     // M5: edit state
     pub edit: EditState,
+
+    // M6: markdown preview
+    pub preview_mode: bool,
+    pub rendered_markdown: Option<Arc<Vec<Line<'static>>>>,
+}
+
+/// True for file extensions we treat as markdown for preview purposes.
+pub fn is_markdown_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("md" | "markdown" | "mdown" | "mkd" | "mkdn")
+    )
 }
 
 #[derive(Default)]
@@ -170,6 +182,7 @@ impl EditBuffer {
 pub struct LoadedFile {
     pub text: String,
     pub highlighted: Arc<Vec<Line<'static>>>,
+    pub rendered_markdown: Option<Arc<Vec<Line<'static>>>>,
 }
 
 pub enum Msg {
@@ -311,6 +324,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
             set_status(state, "refreshing tree...".to_string());
         }
         (KeyCode::Char('d'), _) => toggle_diff(state, cmds),
+        (KeyCode::Char('m'), _) => toggle_preview(state),
         (KeyCode::Char('g'), _) => open_git_status(state),
         (KeyCode::Char('b'), _) => open_worktree_switcher(state),
         (KeyCode::Char('i'), _) | (KeyCode::Char('e'), _) => enter_edit_mode(state),
@@ -450,6 +464,24 @@ fn handle_file_saved(state: &mut AppState, path: PathBuf, result: Result<(), Str
             state.ignore_next_fs_change = None;
             set_status(state, format!("save failed: {e}"));
         }
+    }
+}
+
+fn toggle_preview(state: &mut AppState) {
+    let Some(open) = state.open_file.as_mut() else {
+        set_status(state, "no file open".to_string());
+        return;
+    };
+    if !is_markdown_path(&open.path) {
+        set_status(state, "preview is only for markdown files".to_string());
+        return;
+    }
+    open.preview_mode = !open.preview_mode;
+    // Entering preview mode exits diff mode — the two viewer layouts don't combine.
+    if open.preview_mode {
+        open.diff_mode = false;
+        // Reset scroll — rendered line count != source line count.
+        open.scroll = 0;
     }
 }
 
@@ -841,6 +873,11 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 .as_ref()
                 .filter(|f| f.path == path)
                 .is_some_and(|f| f.diff_mode);
+            let preview_mode = state
+                .open_file
+                .as_ref()
+                .filter(|f| f.path == path)
+                .is_some_and(|f| f.preview_mode);
             state.open_file = Some(OpenFile {
                 path,
                 text: loaded.text,
@@ -851,6 +888,8 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff: None,
                 diff_error: None,
                 edit: EditState::View,
+                preview_mode,
+                rendered_markdown: loaded.rendered_markdown,
             });
             state.focus = Focus::Viewer;
             if is_reload {
@@ -869,6 +908,8 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff: None,
                 diff_error: None,
                 edit: EditState::View,
+                preview_mode: false,
+                rendered_markdown: None,
             });
             set_status(state, msg);
         }
@@ -1129,6 +1170,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            preview_mode: false,
+            rendered_markdown: None,
         });
         let cmds = update(&mut s, Msg::FsChanged(vec![tmpfile.clone()]));
         assert_eq!(s.changes.entries().len(), 1);
@@ -1261,6 +1304,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            preview_mode: false,
+            rendered_markdown: None,
         });
         s.mouse_layout = MouseLayout {
             viewer: Rect {
@@ -1331,6 +1376,7 @@ mod tests {
                 result: Ok(LoadedFile {
                     text: "hi\n".to_string(),
                     highlighted: Arc::new(vec![Line::from("hi")]),
+                    rendered_markdown: None,
                 }),
             },
         );
@@ -1353,6 +1399,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            preview_mode: false,
+            rendered_markdown: None,
         });
         update(
             &mut s,
@@ -1508,6 +1556,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            preview_mode: false,
+            rendered_markdown: None,
         });
         // First press: enter diff mode + request computation.
         let cmds = update(&mut s, Msg::Key(plain('d')));
@@ -1623,6 +1673,51 @@ mod tests {
     }
 
     #[test]
+    fn m_toggles_preview_for_markdown_file() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/readme.md"),
+            text: "# hi\n".to_string(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 5,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+            preview_mode: false,
+            rendered_markdown: None,
+        });
+        update(&mut s, Msg::Key(plain('m')));
+        assert!(s.open_file.as_ref().unwrap().preview_mode);
+        // Entering preview resets scroll (line count differs from source).
+        assert_eq!(s.open_file.as_ref().unwrap().scroll, 0);
+        update(&mut s, Msg::Key(plain('m')));
+        assert!(!s.open_file.as_ref().unwrap().preview_mode);
+    }
+
+    #[test]
+    fn m_on_non_markdown_is_noop_with_status() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/foo.rs"),
+            text: String::new(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+            preview_mode: false,
+            rendered_markdown: None,
+        });
+        update(&mut s, Msg::Key(plain('m')));
+        assert!(!s.open_file.as_ref().unwrap().preview_mode);
+        assert!(s.status.is_some());
+    }
+
+    #[test]
     fn file_loaded_flashes_reloaded_when_already_open() {
         let mut s = fixture();
         s.open_file = Some(OpenFile {
@@ -1635,6 +1730,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            preview_mode: false,
+            rendered_markdown: None,
         });
         update(
             &mut s,
@@ -1643,6 +1740,7 @@ mod tests {
                 result: Ok(LoadedFile {
                     text: String::new(),
                     highlighted: Arc::new(vec![Line::from("x")]),
+                    rendered_markdown: None,
                 }),
             },
         );
@@ -1661,6 +1759,7 @@ mod tests {
                 result: Ok(LoadedFile {
                     text: String::new(),
                     highlighted: Arc::new(vec![Line::from("x")]),
+                    rendered_markdown: None,
                 }),
             },
         );
@@ -1686,6 +1785,8 @@ mod tests {
             diff: None,
             diff_error: None,
             edit: EditState::View,
+            preview_mode: false,
+            rendered_markdown: None,
         }
     }
 

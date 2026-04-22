@@ -360,6 +360,7 @@ fn render_help(area: Rect, frame: &mut Frame) {
         row(":", "command palette"),
         row("?", "this help"),
         row("d", "toggle diff vs HEAD for current file"),
+        row("m", "toggle markdown preview (GFM, code fences, tables)"),
         row("g", "git status overlay"),
         row("b", "switch git worktree"),
         row("i, e", "enter edit mode; Esc exits, Ctrl-S saves"),

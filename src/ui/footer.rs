@@ -100,6 +100,8 @@ pub fn render(state: &AppState, area: Rect, frame: &mut Frame) {
             sep(),
             hint("i", "edit"),
             sep(),
+            hint("m", "preview"),
+            sep(),
             hint("d", "diff"),
             sep(),
             hint_unseen(unseen),

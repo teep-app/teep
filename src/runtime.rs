@@ -4,8 +4,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use crate::{
-    app::{Cmd, LoadedFile, Msg},
-    git, syntax, tree,
+    app::{self, Cmd, LoadedFile, Msg},
+    git, markdown, syntax, tree,
 };
 
 /// Executes side-effecting `Cmd`s emitted by `update`. Results come back as
@@ -120,10 +120,18 @@ async fn load_and_highlight(path: PathBuf) -> Result<LoadedFile, String> {
         .await
         .map_err(|e| e.to_string())?;
 
+    let is_md = app::is_markdown_path(&path);
     let text_for_blocking = text.clone();
     let path_for_blocking = path.clone();
-    let highlighted = tokio::task::spawn_blocking(move || {
-        syntax::highlight_file(&text_for_blocking, &path_for_blocking)
+
+    let (highlighted, rendered_markdown) = tokio::task::spawn_blocking(move || {
+        let highlighted = syntax::highlight_file(&text_for_blocking, &path_for_blocking);
+        let rendered_markdown = if is_md {
+            Some(markdown::render_markdown(&text_for_blocking))
+        } else {
+            None
+        };
+        (highlighted, rendered_markdown)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -131,5 +139,6 @@ async fn load_and_highlight(path: PathBuf) -> Result<LoadedFile, String> {
     Ok(LoadedFile {
         text,
         highlighted: Arc::new(highlighted),
+        rendered_markdown: rendered_markdown.map(Arc::new),
     })
 }

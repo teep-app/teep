@@ -43,6 +43,12 @@ similar = "2"
 # M5: edit mode
 tui-textarea = "0.7"
 
+# M6: markdown rendering (Level A)
+# default-features disables comrak's built-in syntect highlighter (which pulls
+# onig); we use our own syntect pipeline via src/syntax.rs.
+comrak = { version = "0.52", default-features = false }
+textwrap = "0.16"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
