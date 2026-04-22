@@ -8,8 +8,6 @@ Teep sits in the pane next to your coding agent and reads the room. Every file t
 
 A terminal viewer, not an editor. Fast to start, quiet when nothing's happening, impossible to miss when something is. Built in Rust. Ghostty-first. One binary plus the `git` you already have. Press `n` to jump to whatever the agent just did. Press `u` when you've seen enough. That's the loop.
 
-![test.jpeg](test.jpeg)
-
 ---
 
 ## Why
@@ -56,7 +54,7 @@ Early. Under active development. MVP in sight.
 | M6.5 — live preview (Obsidian-style) | done | Reveal-on-cursor: current block raw, everything else cooked |
 | M7 — inline images | done | Kitty / iTerm2 / Sixel / halfblocks fallback |
 | M7.1 — inline markdown images | done | `![](path)` renders in Live Preview, reveals source on cursor |
-| M8 — mermaid | planned | Via `mmdc`, content-hash cached |
+| M8 — mermaid | done | Via `mmdc`, content-hash cached; placeholder when mmdc missing |
 | M9 — polish + release | in progress | Performance, docs, binary release |
 
 The killer feature is **beautiful Markdown rendering with inline images and mermaid diagrams, in the terminal, right next to the agent writing the Markdown.** Most of Teep exists to get there with the right foundation underneath.

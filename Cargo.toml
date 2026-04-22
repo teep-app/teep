@@ -49,6 +49,10 @@ tui-textarea = "0.7"
 comrak = { version = "0.52", default-features = false }
 textwrap = "0.16"
 
+# M8: mermaid diagrams via the external `mmdc` CLI; blake3 only used as
+# a deterministic content-hash for the on-disk PNG cache.
+blake3 = "1"
+
 # M7: inline images via terminal graphics protocols (Kitty/iTerm2/Sixel/halfblock)
 # default features include `chafa-dyn` which links libchafa (C dep) — skip it.
 # Our supported fallback when no graphics protocol is available is the plain

@@ -9,11 +9,22 @@
 //! (ignoring whitespace / soft breaks) becomes an image block — its
 //! `cooked` lines are blanks reserving vertical space, and the preview
 //! overlays a `StatefulImage` widget on that reserved rect.
+//!
+//! M8: a top-level ```` ```mermaid ```` fence, when `mmdc` is on
+//! `$PATH`, becomes either an image block (cache hit) or a
+//! `MermaidRef`-tagged placeholder block (cache miss / rendering /
+//! failed). The cache-hit path feeds the same M7.1 overlay pipeline.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 use comrak::{Arena, nodes::NodeValue, parse_document};
-use ratatui::text::Line;
+use ratatui::{
+    style::{Color, Style},
+    text::{Line, Span},
+};
 
 use super::render;
 
@@ -32,9 +43,14 @@ pub struct LiveBlock {
     /// overlay paints over.
     pub cooked: Vec<Line<'static>>,
     /// `Some` when this block is a sole-image paragraph referencing a local
-    /// file. Mixed "text + image + text" paragraphs stay `None` and fall
-    /// back to the inline `[image: alt]` placeholder in `render::render_inlines`.
+    /// file **or** a mermaid fence whose PNG is already cached. Mixed
+    /// "text + image + text" paragraphs stay `None` and fall back to the
+    /// inline `[image: alt]` placeholder in `render::render_inlines`.
     pub image: Option<InlineImageRef>,
+    /// `Some` when this block is a mermaid fence that needs to be
+    /// rendered by `mmdc` (cache miss / currently rendering / failed).
+    /// Mutually exclusive with `image`.
+    pub mermaid: Option<MermaidRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +62,14 @@ pub struct InlineImageRef {
     pub height_cells: u16,
 }
 
+#[derive(Clone, Debug)]
+pub struct MermaidRef {
+    /// The fence body — what `mmdc` consumes as input.
+    pub source: String,
+    /// blake3 hex of `(source + theme)` — stable cache key.
+    pub hash: String,
+}
+
 /// Parse `text` and produce one `LiveBlock` per top-level markdown block.
 ///
 /// `markdown_dir`, if provided, is the parent directory of the markdown
@@ -54,11 +78,22 @@ pub struct InlineImageRef {
 /// buffers) — relative image URLs then never materialise into image
 /// blocks.
 ///
+/// `mermaid_rendering` is the set of fence hashes currently being
+/// rendered by `mmdc`; `mermaid_failed` maps hash → last error message.
+/// Both are consulted only to pick the right placeholder text for mermaid
+/// blocks that aren't in the cache yet — the scheduling itself happens in
+/// the caller.
+///
 /// Source ranges are 0-indexed line offsets into the raw buffer. Comrak's
 /// `sourcepos` is 1-indexed line / column; we translate to 0-indexed lines
 /// and treat `end.line` as *inclusive*, so the half-open `[start, end)`
 /// we produce spans every buffer line the block occupies.
-pub fn parse_blocks(text: &str, markdown_dir: Option<&Path>) -> Vec<LiveBlock> {
+pub fn parse_blocks(
+    text: &str,
+    markdown_dir: Option<&Path>,
+    mermaid_rendering: &HashSet<String>,
+    mermaid_failed: &HashMap<String, String>,
+) -> Vec<LiveBlock> {
     let arena = Arena::new();
     let options = render::build_options();
     let root = parse_document(&arena, text, &options);
@@ -76,18 +111,47 @@ pub fn parse_blocks(text: &str, markdown_dir: Option<&Path>) -> Vec<LiveBlock> {
         let source_start = start_line_1 - 1;
         let source_end = end_line_1;
 
-        let image = detect_image_paragraph(node)
-            .and_then(|(url, alt)| resolve_local_image(&url, markdown_dir).map(|p| (p, alt)))
-            .map(|(path, alt)| InlineImageRef {
-                path,
-                alt,
-                height_cells: INLINE_IMAGE_ROWS,
-            });
-
-        let cooked = if image.is_some() {
-            vec![Line::from(""); INLINE_IMAGE_ROWS as usize]
+        // Mermaid fences: only dispatched when `mmdc` is reachable — in
+        // its absence the node falls through to the default cooked render,
+        // which already emits a bordered "install mmdc to render" block.
+        let mermaid_source = detect_mermaid_fence(node);
+        let (image, mermaid, cooked) = if let Some(source) = mermaid_source
+            && crate::mermaid::is_available()
+        {
+            let theme = crate::mermaid::DEFAULT_THEME;
+            let hash = crate::mermaid::cache_key(&source, theme);
+            if let Some(path) = crate::mermaid::cached_path(&hash) {
+                // Cache hit — render as a regular image block.
+                let alt = format!("mermaid:{}", &hash[..8.min(hash.len())]);
+                let image_ref = InlineImageRef {
+                    path,
+                    alt,
+                    height_cells: INLINE_IMAGE_ROWS,
+                };
+                let cooked = vec![Line::from(""); INLINE_IMAGE_ROWS as usize];
+                (Some(image_ref), None, cooked)
+            } else {
+                // Cache miss — emit a placeholder and tag for scheduling.
+                let failed = mermaid_failed.get(&hash).map(|s| s.as_str());
+                let cooked =
+                    mermaid_placeholder(&source, failed, mermaid_rendering.contains(&hash));
+                let mermaid_ref = MermaidRef { source, hash };
+                (None, Some(mermaid_ref), cooked)
+            }
         } else {
-            render::render_block_to_lines(node)
+            let image_ref = detect_image_paragraph(node)
+                .and_then(|(url, alt)| resolve_local_image(&url, markdown_dir).map(|p| (p, alt)))
+                .map(|(path, alt)| InlineImageRef {
+                    path,
+                    alt,
+                    height_cells: INLINE_IMAGE_ROWS,
+                });
+            let cooked = if image_ref.is_some() {
+                vec![Line::from(""); INLINE_IMAGE_ROWS as usize]
+            } else {
+                render::render_block_to_lines(node)
+            };
+            (image_ref, None, cooked)
         };
 
         blocks.push(LiveBlock {
@@ -95,9 +159,60 @@ pub fn parse_blocks(text: &str, markdown_dir: Option<&Path>) -> Vec<LiveBlock> {
             source_end,
             cooked,
             image,
+            mermaid,
         });
     }
     blocks
+}
+
+/// Cooked placeholder lines for a mermaid fence that's not yet in the
+/// cache. Shown while `mmdc` is running or after a failed render — the
+/// raw source stays visible inside the border so the user can spot
+/// syntax problems without bouncing to source view.
+fn mermaid_placeholder(source: &str, failed: Option<&str>, rendering: bool) -> Vec<Line<'static>> {
+    let border_style = Style::default().fg(Color::Magenta);
+    let dim = Style::default().fg(Color::DarkGray);
+    let title = if failed.is_some() {
+        "mermaid · failed"
+    } else if rendering {
+        "mermaid · rendering…"
+    } else {
+        "mermaid"
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        format!("╭─ {title} ─"),
+        border_style,
+    ))];
+    for line in source.lines() {
+        lines.push(Line::from(Span::styled(format!("│ {line}"), dim)));
+    }
+    if let Some(err) = failed {
+        lines.push(Line::from(Span::styled(
+            format!("│ ✖ {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "╰───────────────────────────────────────────────",
+        border_style,
+    )));
+    lines
+}
+
+/// If `node` is a top-level mermaid code fence, return its source body.
+fn detect_mermaid_fence<'a>(node: &'a comrak::nodes::AstNode<'a>) -> Option<String> {
+    let data = node.data.borrow();
+    match &data.value {
+        NodeValue::CodeBlock(cb) => {
+            let lang = cb.info.split_whitespace().next().unwrap_or("");
+            if lang == "mermaid" {
+                Some(cb.literal.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// If `node` is a `Paragraph` whose inline children are exactly one `Image`
@@ -193,7 +308,7 @@ mod tests {
     #[test]
     fn two_paragraphs_have_distinct_ranges() {
         let text = "first paragraph\n\nsecond paragraph\n";
-        let blocks = parse_blocks(text, None);
+        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].source_end <= blocks[1].source_start);
     }
@@ -201,7 +316,7 @@ mod tests {
     #[test]
     fn heading_and_code_block_are_separate_blocks() {
         let text = "# Title\n\n```rust\nfn x() {}\n```\n";
-        let blocks = parse_blocks(text, None);
+        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
         assert_eq!(blocks.len(), 2, "expected heading + code fence");
         assert_eq!(blocks[0].source_start, 0, "heading starts at line 0");
     }
@@ -209,7 +324,7 @@ mod tests {
     #[test]
     fn block_at_row_finds_containing_block() {
         let text = "# Title\n\nBody paragraph.\n";
-        let blocks = parse_blocks(text, None);
+        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
         assert_eq!(block_at_row(&blocks, 0), Some(0), "line 0 = heading");
         assert_eq!(block_at_row(&blocks, 2), Some(1), "line 2 = paragraph");
     }
@@ -217,14 +332,14 @@ mod tests {
     #[test]
     fn block_at_row_returns_none_for_blank_row_between_blocks() {
         let text = "one\n\nthree\n";
-        let blocks = parse_blocks(text, None);
+        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
         // Line 1 is the blank between two paragraphs — not owned by either.
         assert_eq!(block_at_row(&blocks, 1), None);
     }
 
     #[test]
     fn cooked_lines_are_populated() {
-        let blocks = parse_blocks("# Hello\n", None);
+        let blocks = parse_blocks("# Hello\n", None, &HashSet::new(), &HashMap::new());
         assert!(!blocks[0].cooked.is_empty());
     }
 
@@ -244,7 +359,7 @@ mod tests {
         write_tmp_png(tmp.path(), "a.png");
 
         let text = "![alt text](a.png)\n";
-        let blocks = parse_blocks(text, Some(tmp.path()));
+        let blocks = parse_blocks(text, Some(tmp.path()), &HashSet::new(), &HashMap::new());
         assert_eq!(blocks.len(), 1);
         let img = blocks[0].image.as_ref().expect("image block");
         assert_eq!(img.alt, "alt text");
@@ -258,7 +373,7 @@ mod tests {
         write_tmp_png(tmp.path(), "b.png");
 
         let text = "look: ![x](b.png) inline\n";
-        let blocks = parse_blocks(text, Some(tmp.path()));
+        let blocks = parse_blocks(text, Some(tmp.path()), &HashSet::new(), &HashMap::new());
         assert_eq!(blocks.len(), 1);
         assert!(
             blocks[0].image.is_none(),
@@ -270,21 +385,21 @@ mod tests {
     fn missing_image_falls_back_to_text_block() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let text = "![](nope.png)\n";
-        let blocks = parse_blocks(text, Some(tmp.path()));
+        let blocks = parse_blocks(text, Some(tmp.path()), &HashSet::new(), &HashMap::new());
         assert!(blocks[0].image.is_none());
     }
 
     #[test]
     fn http_image_falls_back_to_text_block() {
         let text = "![](https://example.com/x.png)\n";
-        let blocks = parse_blocks(text, None);
+        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
         assert!(blocks[0].image.is_none());
     }
 
     #[test]
     fn data_uri_image_falls_back_to_text_block() {
         let text = "![](data:image/png;base64,AAAA)\n";
-        let blocks = parse_blocks(text, None);
+        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
         assert!(blocks[0].image.is_none());
     }
 
@@ -292,7 +407,7 @@ mod tests {
     fn relative_image_without_markdown_dir_falls_back() {
         // No markdown_dir → relative path cannot resolve.
         let text = "![](a.png)\n";
-        let blocks = parse_blocks(text, None);
+        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
         assert!(blocks[0].image.is_none());
     }
 
@@ -301,7 +416,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let p = write_tmp_png(tmp.path(), "abs.png");
         let text = format!("![]({})\n", p.display());
-        let blocks = parse_blocks(&text, None);
+        let blocks = parse_blocks(&text, None, &HashSet::new(), &HashMap::new());
         assert!(blocks[0].image.is_some(), "absolute path should resolve");
     }
 }

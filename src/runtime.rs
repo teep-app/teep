@@ -5,7 +5,7 @@ use tracing::{debug, warn};
 
 use crate::{
     app::{Cmd, LoadedFile, Msg},
-    git, image, syntax, tree,
+    git, image, mermaid, syntax, tree,
 };
 
 /// Executes side-effecting `Cmd`s emitted by `update`. Results come back as
@@ -37,6 +37,12 @@ impl Runtime {
                 buffer_path,
                 image_path,
             } => self.spawn_load_inline_image(buffer_path, image_path),
+            Cmd::RenderMermaid {
+                buffer_path,
+                hash,
+                source,
+                theme,
+            } => self.spawn_render_mermaid(buffer_path, hash, source, theme),
         }
     }
 
@@ -142,6 +148,31 @@ impl Runtime {
             let _ = tx.send(Msg::InlineImageLoaded {
                 buffer_path,
                 image_path,
+                result,
+            });
+        });
+    }
+
+    fn spawn_render_mermaid(
+        &self,
+        buffer_path: PathBuf,
+        hash: String,
+        source: String,
+        theme: String,
+    ) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            debug!(?buffer_path, %hash, "rendering mermaid");
+            let result =
+                tokio::task::spawn_blocking(move || mermaid::render(&source, &theme)).await;
+            let result = match result {
+                Ok(Ok(path)) => Ok(path),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("mermaid render task panicked: {e}")),
+            };
+            let _ = tx.send(Msg::MermaidRendered {
+                buffer_path,
+                hash,
                 result,
             });
         });

@@ -8,6 +8,7 @@ mod fs_watch;
 mod git;
 mod image;
 mod markdown;
+mod mermaid;
 mod runtime;
 mod syntax;
 mod tree;

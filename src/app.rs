@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Stdout,
     path::{Path, PathBuf},
     sync::Arc,
@@ -174,6 +174,14 @@ pub struct EditBuffer {
     /// Per-path cache of inline image decode state. Populated lazily as
     /// `![](path)` references appear in the buffer.
     pub inline_images: HashMap<PathBuf, InlineImageState>,
+    /// M8: hashes of mermaid fences currently being rendered by `mmdc`.
+    /// Used to deduplicate `Cmd::RenderMermaid` emissions and to pick the
+    /// "rendering…" vs "unknown" placeholder title.
+    pub mermaid_rendering: HashSet<String>,
+    /// M8: hashes of mermaid fences whose last render attempt failed,
+    /// mapped to the error message. Cleared when the same hash eventually
+    /// renders successfully.
+    pub mermaid_failed: HashMap<String, String>,
 }
 
 /// State of an inline markdown image's decode.
@@ -188,6 +196,18 @@ pub enum InlineImageState {
     Failed(String),
 }
 
+/// Return type from `EditBuffer::new_live` / `refresh_live_blocks` — the
+/// new work the caller needs to schedule on the runtime.
+#[derive(Default)]
+pub struct BufferDeltas {
+    /// Absolute image paths referenced for the first time. Each gets a
+    /// `Cmd::LoadInlineImage`.
+    pub new_images: Vec<PathBuf>,
+    /// `(hash, source)` pairs for mermaid fences seen for the first time.
+    /// Each gets a `Cmd::RenderMermaid`.
+    pub new_mermaids: Vec<(String, String)>,
+}
+
 impl EditBuffer {
     pub fn new(initial: &str) -> Self {
         let lines: Vec<String> = initial.split('\n').map(|s| s.to_string()).collect();
@@ -197,23 +217,40 @@ impl EditBuffer {
             live_blocks: None,
             markdown_dir: None,
             inline_images: HashMap::new(),
+            mermaid_rendering: HashSet::new(),
+            mermaid_failed: HashMap::new(),
         }
     }
 
     /// Construct an edit buffer that starts in Live Preview mode
     /// (markdown blocks parsed and ready to be rendered cooked/raw).
-    /// Returns the buffer and the list of image paths that need decoding.
-    pub fn new_live(initial: &str, markdown_dir: Option<PathBuf>) -> (Self, Vec<PathBuf>) {
-        let blocks = markdown::parse_blocks(initial, markdown_dir.as_deref());
+    /// Returns the buffer and the deltas the caller needs to schedule.
+    pub fn new_live(initial: &str, markdown_dir: Option<PathBuf>) -> (Self, BufferDeltas) {
+        let mermaid_rendering: HashSet<String> = HashSet::new();
+        let mermaid_failed: HashMap<String, String> = HashMap::new();
+        let blocks = markdown::parse_blocks(
+            initial,
+            markdown_dir.as_deref(),
+            &mermaid_rendering,
+            &mermaid_failed,
+        );
         let lines: Vec<String> = initial.split('\n').map(|s| s.to_string()).collect();
         let mut inline_images: HashMap<PathBuf, InlineImageState> = HashMap::new();
-        let mut needed: Vec<PathBuf> = Vec::new();
+        let mut deltas = BufferDeltas::default();
+        let mut mermaid_rendering = mermaid_rendering;
         for b in &blocks {
             if let Some(img) = &b.image
                 && !inline_images.contains_key(&img.path)
             {
                 inline_images.insert(img.path.clone(), InlineImageState::Loading);
-                needed.push(img.path.clone());
+                deltas.new_images.push(img.path.clone());
+            }
+            if let Some(m) = &b.mermaid
+                && !mermaid_rendering.contains(&m.hash)
+                && !mermaid_failed.contains_key(&m.hash)
+            {
+                mermaid_rendering.insert(m.hash.clone());
+                deltas.new_mermaids.push((m.hash.clone(), m.source.clone()));
             }
         }
         let buffer = Self {
@@ -222,8 +259,10 @@ impl EditBuffer {
             live_blocks: Some(blocks),
             markdown_dir,
             inline_images,
+            mermaid_rendering,
+            mermaid_failed,
         };
-        (buffer, needed)
+        (buffer, deltas)
     }
 
     pub fn current_text(&self) -> String {
@@ -235,27 +274,40 @@ impl EditBuffer {
     }
 
     /// Re-parse the buffer's current text into live-preview blocks. Returns
-    /// the set of image paths referenced for the first time (each inserted
-    /// into `inline_images` as `Loading` before the list is returned, so the
-    /// caller is responsible for emitting `Cmd::LoadInlineImage` for each).
-    pub fn refresh_live_blocks(&mut self) -> Vec<PathBuf> {
+    /// a `BufferDeltas` describing what the caller needs to schedule on
+    /// the runtime. Any newly-referenced images are inserted into
+    /// `inline_images` as `Loading`, and any newly-seen mermaid hashes
+    /// into `mermaid_rendering`, so the caller just drains and dispatches.
+    pub fn refresh_live_blocks(&mut self) -> BufferDeltas {
         if self.live_blocks.is_none() {
-            return Vec::new();
+            return BufferDeltas::default();
         }
         let text = self.current_text();
-        let blocks = markdown::parse_blocks(&text, self.markdown_dir.as_deref());
-        let mut needed: Vec<PathBuf> = Vec::new();
+        let blocks = markdown::parse_blocks(
+            &text,
+            self.markdown_dir.as_deref(),
+            &self.mermaid_rendering,
+            &self.mermaid_failed,
+        );
+        let mut deltas = BufferDeltas::default();
         for b in &blocks {
             if let Some(img) = &b.image
                 && !self.inline_images.contains_key(&img.path)
             {
                 self.inline_images
                     .insert(img.path.clone(), InlineImageState::Loading);
-                needed.push(img.path.clone());
+                deltas.new_images.push(img.path.clone());
+            }
+            if let Some(m) = &b.mermaid
+                && !self.mermaid_rendering.contains(&m.hash)
+                && !self.mermaid_failed.contains_key(&m.hash)
+            {
+                self.mermaid_rendering.insert(m.hash.clone());
+                deltas.new_mermaids.push((m.hash.clone(), m.source.clone()));
             }
         }
         self.live_blocks = Some(blocks);
-        needed
+        deltas
     }
 
     pub fn is_live_preview(&self) -> bool {
@@ -294,6 +346,14 @@ pub enum Msg {
         image_path: PathBuf,
         result: Result<image::DynamicImage, String>,
     },
+    /// A mermaid fence render (via `mmdc`) completed. On `Ok`, the cache
+    /// file is ready; a re-parse turns the block into an image block. On
+    /// `Err`, the hash moves from `mermaid_rendering` to `mermaid_failed`.
+    MermaidRendered {
+        buffer_path: PathBuf,
+        hash: String,
+        result: Result<PathBuf, String>,
+    },
     TreeRebuilt(tree::Node),
     GitRefreshed(Result<GitSnapshot, String>),
     DiffReady {
@@ -321,6 +381,14 @@ pub enum Cmd {
         buffer_path: PathBuf,
         image_path: PathBuf,
     },
+    /// Render a mermaid fence via `mmdc`. `hash` is the cache key;
+    /// `source` is the fence body; `theme` is the mmdc theme string.
+    RenderMermaid {
+        buffer_path: PathBuf,
+        hash: String,
+        source: String,
+        theme: String,
+    },
 }
 
 const CTRL_C_QUIT_WINDOW: Duration = Duration::from_millis(1000);
@@ -344,6 +412,11 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
             image_path,
             result,
         } => handle_inline_image_loaded(state, buffer_path, image_path, result),
+        Msg::MermaidRendered {
+            buffer_path,
+            hash,
+            result,
+        } => handle_mermaid_rendered(state, buffer_path, hash, result, &mut cmds),
         Msg::TreeRebuilt(node) => state.tree.graft(node),
         Msg::GitRefreshed(result) => handle_git_refreshed(state, result),
         Msg::DiffReady { path, result } => handle_diff_ready(state, path, result),
@@ -469,19 +542,35 @@ fn enter_edit_mode(state: &mut AppState, cmds: &mut Vec<Cmd>) {
     let buffer_path = open.path.clone();
     let buffer = if is_markdown_path(&open.path) {
         let markdown_dir = open.path.parent().map(|p| p.to_path_buf());
-        let (buffer, needed) = EditBuffer::new_live(&open.text, markdown_dir);
-        for image_path in needed {
-            cmds.push(Cmd::LoadInlineImage {
-                buffer_path: buffer_path.clone(),
-                image_path,
-            });
-        }
+        let (buffer, deltas) = EditBuffer::new_live(&open.text, markdown_dir);
+        dispatch_buffer_deltas(&buffer_path, deltas, cmds);
         buffer
     } else {
         EditBuffer::new(&open.text)
     };
     open.edit = EditState::Edit(buffer);
     state.focus = Focus::Viewer;
+}
+
+/// Convert `BufferDeltas` into concrete `Cmd`s for the runtime. Used by
+/// every call site that mutates the buffer's `live_blocks`
+/// (`enter_edit_mode`, `handle_edit_key`, and the post-render re-parse
+/// inside `handle_mermaid_rendered`).
+fn dispatch_buffer_deltas(buffer_path: &Path, deltas: BufferDeltas, cmds: &mut Vec<Cmd>) {
+    for image_path in deltas.new_images {
+        cmds.push(Cmd::LoadInlineImage {
+            buffer_path: buffer_path.to_path_buf(),
+            image_path,
+        });
+    }
+    for (hash, source) in deltas.new_mermaids {
+        cmds.push(Cmd::RenderMermaid {
+            buffer_path: buffer_path.to_path_buf(),
+            hash,
+            source,
+            theme: crate::mermaid::DEFAULT_THEME.to_string(),
+        });
+    }
 }
 
 fn handle_edit_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
@@ -505,7 +594,8 @@ fn handle_edit_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
         return;
     }
     // Everything else flows into the text area. Re-parse Live Preview
-    // blocks after any mutation and schedule decodes for any new images.
+    // blocks after any mutation and schedule decodes for any new images
+    // or mermaid renders.
     let Some(open) = state.open_file.as_mut() else {
         return;
     };
@@ -514,12 +604,8 @@ fn handle_edit_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
         let input: Input = Input::from(key);
         let mutated = buffer.textarea.input(input);
         if mutated && buffer.is_live_preview() {
-            for image_path in buffer.refresh_live_blocks() {
-                cmds.push(Cmd::LoadInlineImage {
-                    buffer_path: buffer_path.clone(),
-                    image_path,
-                });
-            }
+            let deltas = buffer.refresh_live_blocks();
+            dispatch_buffer_deltas(&buffer_path, deltas, cmds);
         }
     }
 }
@@ -666,6 +752,44 @@ fn handle_inline_image_loaded(
         Err(e) => InlineImageState::Failed(e),
     };
     buffer.inline_images.insert(image_path, new_state);
+}
+
+fn handle_mermaid_rendered(
+    state: &mut AppState,
+    buffer_path: PathBuf,
+    hash: String,
+    result: Result<PathBuf, String>,
+    cmds: &mut Vec<Cmd>,
+) {
+    // Same guards as handle_inline_image_loaded: drop the result if the
+    // user has navigated away from this file or dropped out of Live
+    // Preview in the interim.
+    let Some(open) = state.open_file.as_mut() else {
+        return;
+    };
+    if open.path != buffer_path {
+        return;
+    }
+    let EditState::Edit(buffer) = &mut open.edit else {
+        return;
+    };
+    buffer.mermaid_rendering.remove(&hash);
+    match result {
+        Ok(_path) => {
+            // Render succeeded — the cache file now exists on disk, so a
+            // re-parse flips the block into an image block on the next tick.
+            buffer.mermaid_failed.remove(&hash);
+        }
+        Err(e) => {
+            tracing::warn!(%hash, error = %e, "mermaid render failed");
+            buffer.mermaid_failed.insert(hash, e);
+        }
+    }
+    // Re-parse so the placeholder / image state catches up. Any newly
+    // scheduled work (e.g. a pending image decode now that mermaid is
+    // ready) gets dispatched the same way the edit path does.
+    let deltas = buffer.refresh_live_blocks();
+    dispatch_buffer_deltas(&buffer_path, deltas, cmds);
 }
 
 fn handle_file_saved(state: &mut AppState, path: PathBuf, result: Result<(), String>) {
@@ -2325,6 +2449,73 @@ mod tests {
                 ),
                 "mismatched buffer_path must not mutate state"
             ),
+            _ => panic!("expected Edit"),
+        }
+    }
+
+    #[test]
+    fn mermaid_err_moves_hash_from_rendering_to_failed() {
+        let mut s = fixture();
+        let buffer_path = PathBuf::from("/tmp/doc.md");
+        s.open_file = Some(open_file_with_text("stub\n", buffer_path.clone()));
+        let (mut buf, _) = EditBuffer::new_live("stub\n", None);
+        let hash = "abc123".to_string();
+        buf.mermaid_rendering.insert(hash.clone());
+        s.open_file.as_mut().unwrap().edit = EditState::Edit(buf);
+
+        update(
+            &mut s,
+            Msg::MermaidRendered {
+                buffer_path,
+                hash: hash.clone(),
+                result: Err("syntax error near line 2".to_string()),
+            },
+        );
+
+        match &s.open_file.as_ref().unwrap().edit {
+            EditState::Edit(b) => {
+                assert!(
+                    !b.mermaid_rendering.contains(&hash),
+                    "removed from rendering"
+                );
+                assert_eq!(
+                    b.mermaid_failed.get(&hash).map(String::as_str),
+                    Some("syntax error near line 2"),
+                );
+            }
+            _ => panic!("expected Edit"),
+        }
+    }
+
+    #[test]
+    fn mermaid_rendered_result_dropped_when_buffer_path_mismatches() {
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text(
+            "stub\n",
+            PathBuf::from("/tmp/current.md"),
+        ));
+        let (mut buf, _) = EditBuffer::new_live("stub\n", None);
+        let hash = "xyz".to_string();
+        buf.mermaid_rendering.insert(hash.clone());
+        s.open_file.as_mut().unwrap().edit = EditState::Edit(buf);
+
+        update(
+            &mut s,
+            Msg::MermaidRendered {
+                buffer_path: PathBuf::from("/tmp/other.md"),
+                hash: hash.clone(),
+                result: Err("ignored".to_string()),
+            },
+        );
+
+        match &s.open_file.as_ref().unwrap().edit {
+            EditState::Edit(b) => {
+                assert!(
+                    b.mermaid_rendering.contains(&hash),
+                    "mismatched buffer_path must not mutate state"
+                );
+                assert!(b.mermaid_failed.is_empty());
+            }
             _ => panic!("expected Edit"),
         }
     }
