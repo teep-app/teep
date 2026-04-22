@@ -22,6 +22,12 @@ use directories::ProjectDirs;
 /// arrives with the broader theming pass.
 pub const DEFAULT_THEME: &str = "dark";
 
+/// Pixel width we ask `mmdc` to render at. Big enough to look crisp when
+/// scaled down into the preview pane and to stay sharp on Retina
+/// terminals; small enough that PNGs don't bloat the cache. Included in
+/// the cache key so a future bump auto-invalidates stale entries.
+const RENDER_WIDTH_PX: u32 = 2400;
+
 static MMDC_PRESENT: OnceLock<bool> = OnceLock::new();
 
 /// True when `mmdc` is reachable on the current `$PATH`. Result is
@@ -44,13 +50,17 @@ pub fn cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "", "teep").map(|d| d.cache_dir().join("mermaid"))
 }
 
-/// Content-hash of `(source, theme)` — deterministic across runs and
-/// across machines, which is what makes the on-disk cache safe.
+/// Content-hash of `(source, theme, render width)` — deterministic across
+/// runs and across machines, which is what makes the on-disk cache safe.
+/// Including the render width means bumping `RENDER_WIDTH_PX` silently
+/// invalidates stale small PNGs without a manual cache wipe.
 pub fn cache_key(source: &str, theme: &str) -> String {
     let mut h = blake3::Hasher::new();
     h.update(source.as_bytes());
     h.update(b"|");
     h.update(theme.as_bytes());
+    h.update(b"|w=");
+    h.update(RENDER_WIDTH_PX.to_string().as_bytes());
     h.finalize().to_hex().to_string()
 }
 
@@ -89,6 +99,8 @@ pub fn render(source: &str, theme: &str) -> Result<PathBuf> {
         .arg(theme)
         .arg("-b")
         .arg("transparent")
+        .arg("-w")
+        .arg(RENDER_WIDTH_PX.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

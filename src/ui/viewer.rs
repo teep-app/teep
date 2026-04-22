@@ -228,7 +228,12 @@ fn render_image(
     // `StatefulProtocol`. We keep the protocol in a `RefCell` because our
     // render path has only `&AppState`.
     let mut protocol = image_cell.borrow_mut();
-    let widget = ratatui_image::StatefulImage::<ratatui_image::protocol::StatefulProtocol>::new();
+    // `Resize::Scale` (rather than the default `Fit`) upscales images that
+    // are smaller than the render area — important for mermaid PNGs, which
+    // `mmdc` produces at a fixed modest width and would otherwise render
+    // pinned at native size in the top-left of a much larger rect.
+    let widget = ratatui_image::StatefulImage::<ratatui_image::protocol::StatefulProtocol>::new()
+        .resize(ratatui_image::Resize::Scale(None));
     frame.render_stateful_widget(widget, area, &mut *protocol);
 }
 
@@ -347,7 +352,8 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
                 let mut protocol = cell.borrow_mut();
                 let widget = ratatui_image::StatefulImage::<
                     ratatui_image::protocol::StatefulProtocol,
-                >::new();
+                >::new()
+                .resize(ratatui_image::Resize::Scale(None));
                 frame.render_stateful_widget(widget, rect, &mut *protocol);
             }
             Some(InlineImageState::Loading) => {
