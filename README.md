@@ -27,12 +27,12 @@ flowchart LR
     FS[("Codebase<br/>+ git")]
     Teep["Teep<br/>right pane"]
 
-    Dev      -->|prompt, review|    Agent
-    Agent    -->|writes files|      FS
-    FS       -.->|fs-watch events|  Teep
-    Teep     -->|live view · diffs<br/>markdown · change log|  Dev
-    Dev      -.->|occasional edit|  Teep
-    Teep     -.->|save|             FS
+    Dev -->|"prompt, review"| Agent
+    Agent -->|"writes files"| FS
+    FS -.->|"fs-watch events"| Teep
+    Teep -->|"live view · diffs<br/>markdown · change log"| Dev
+    Dev -.->|"occasional edit"| Teep
+    Teep -.->|"save"| FS
 ```
 
 Solid arrows are the main flow: you drive the agent, the agent edits the repo. Dotted arrows are Teep's contribution: it tails the filesystem so you always know what just happened, and it lets you reach in and fix the occasional typo without context-switching out of the session.
