@@ -16,6 +16,7 @@ use crate::{
     event::EventLoop,
     finder::{self, FinderState},
     fs_watch,
+    git::{DiffLine, GitSnapshot, WorktreeEntry},
     runtime::Runtime,
     tree::{self, NodeKind, Tree},
 };
@@ -39,9 +40,17 @@ pub struct AppState {
     /// back to the thing that was visible at that screen cell.
     pub mouse_layout: MouseLayout,
     pub overlay: Overlay,
+
+    // M4: git
+    pub git_snapshot: Option<GitSnapshot>,
+    pub git_dirty: bool,
+    pub last_git_refresh: Instant,
+    /// Set by `Msg::ReRootRequested`; the outer `run` loop observes this and
+    /// restarts the session at the new path.
+    pub reroot_to: Option<PathBuf>,
 }
 
-/// Modal overlays that steal keyboard focus. Triggered by `/`, `:`, `?`.
+/// Modal overlays that steal keyboard focus. Triggered by `/`, `:`, `?`, `g`, `b`.
 #[derive(Default)]
 pub enum Overlay {
     #[default]
@@ -49,6 +58,33 @@ pub enum Overlay {
     Finder(FinderState),
     Palette(PaletteState),
     Help,
+    GitStatus,
+    WorktreeSwitcher(WorktreeSwitcherState),
+}
+
+pub struct WorktreeSwitcherState {
+    pub worktrees: Vec<WorktreeEntry>,
+    pub selected: usize,
+}
+
+impl WorktreeSwitcherState {
+    pub fn new(worktrees: Vec<WorktreeEntry>) -> Self {
+        let selected = worktrees.iter().position(|w| w.is_current).unwrap_or(0);
+        Self {
+            worktrees,
+            selected,
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.worktrees.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
 }
 
 impl Overlay {
@@ -74,11 +110,16 @@ pub enum Focus {
 
 pub struct OpenFile {
     pub path: PathBuf,
-    #[allow(dead_code)] // full text retained for future edit mode / diff in M4/M5
+    #[allow(dead_code)] // full text retained for edit mode (M5)
     pub text: String,
     pub highlighted: Arc<Vec<Line<'static>>>,
     pub scroll: usize,
     pub error: Option<String>,
+
+    // M4: diff view
+    pub diff_mode: bool,
+    pub diff: Option<Arc<Vec<DiffLine>>>,
+    pub diff_error: Option<String>,
 }
 
 pub struct LoadedFile {
@@ -97,18 +138,29 @@ pub enum Msg {
         result: Result<LoadedFile, String>,
     },
     TreeRebuilt(tree::Node),
+    GitRefreshed(Result<GitSnapshot, String>),
+    DiffReady {
+        path: PathBuf,
+        result: Result<Vec<DiffLine>, String>,
+    },
+    ReRootRequested(PathBuf),
     Tick,
 }
 
 pub enum Cmd {
     LoadFile(PathBuf),
     RebuildTree,
+    RefreshGit,
+    ComputeDiff(PathBuf),
+    ReRoot(PathBuf),
 }
 
 const CTRL_C_QUIT_WINDOW: Duration = Duration::from_millis(1000);
 const STATUS_LIFETIME: Duration = Duration::from_secs(2);
 const PAGE_SCROLL: usize = 20;
 const TREE_REBUILD_THROTTLE: Duration = Duration::from_millis(500);
+const GIT_REFRESH_ON_DIRTY: Duration = Duration::from_secs(1);
+const GIT_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
     let mut cmds = Vec::new();
@@ -118,6 +170,9 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
         Msg::FsChanged(paths) => handle_fs_changed(state, paths, &mut cmds),
         Msg::FileLoaded { path, result } => handle_file_loaded(state, path, result),
         Msg::TreeRebuilt(node) => state.tree.graft(node),
+        Msg::GitRefreshed(result) => handle_git_refreshed(state, result),
+        Msg::DiffReady { path, result } => handle_diff_ready(state, path, result),
+        Msg::ReRootRequested(path) => state.reroot_to = Some(path),
         Msg::Tick => handle_tick(state, &mut cmds),
         Msg::Resize(_, _) => {}
     }
@@ -180,11 +235,45 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
             cmds.push(Cmd::RebuildTree);
             set_status(state, "refreshing tree...".to_string());
         }
+        (KeyCode::Char('d'), _) => toggle_diff(state, cmds),
+        (KeyCode::Char('g'), _) => open_git_status(state),
+        (KeyCode::Char('b'), _) => open_worktree_switcher(state),
         _ => match state.focus {
             Focus::Tree => handle_tree_key(state, key, cmds),
             Focus::Viewer => handle_viewer_key(state, key),
         },
     }
+}
+
+fn toggle_diff(state: &mut AppState, cmds: &mut Vec<Cmd>) {
+    let Some(f) = state.open_file.as_mut() else {
+        set_status(state, "no file open".to_string());
+        return;
+    };
+    f.diff_mode = !f.diff_mode;
+    if f.diff_mode && f.diff.is_none() && f.diff_error.is_none() {
+        cmds.push(Cmd::ComputeDiff(f.path.clone()));
+    }
+}
+
+fn open_git_status(state: &mut AppState) {
+    if state.git_snapshot.is_none() {
+        set_status(state, "not a git repository".to_string());
+        return;
+    }
+    state.overlay = Overlay::GitStatus;
+}
+
+fn open_worktree_switcher(state: &mut AppState) {
+    let Some(snap) = state.git_snapshot.as_ref() else {
+        set_status(state, "not a git repository".to_string());
+        return;
+    };
+    if snap.worktrees.is_empty() {
+        set_status(state, "no worktrees".to_string());
+        return;
+    }
+    state.overlay = Overlay::WorktreeSwitcher(WorktreeSwitcherState::new(snap.worktrees.clone()));
 }
 
 fn handle_ctrl_c(state: &mut AppState) {
@@ -252,17 +341,19 @@ fn handle_overlay_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) 
         KeyCode::Up => match &mut state.overlay {
             Overlay::Finder(f) => f.move_up(),
             Overlay::Palette(p) => p.move_up(),
-            Overlay::Help | Overlay::None => {}
+            Overlay::WorktreeSwitcher(w) => w.move_up(),
+            Overlay::Help | Overlay::GitStatus | Overlay::None => {}
         },
         KeyCode::Down => match &mut state.overlay {
             Overlay::Finder(f) => f.move_down(),
             Overlay::Palette(p) => p.move_down(),
-            Overlay::Help | Overlay::None => {}
+            Overlay::WorktreeSwitcher(w) => w.move_down(),
+            Overlay::Help | Overlay::GitStatus | Overlay::None => {}
         },
         KeyCode::Backspace => match &mut state.overlay {
             Overlay::Finder(f) => f.pop(),
             Overlay::Palette(p) => p.pop(),
-            Overlay::Help | Overlay::None => {}
+            _ => {}
         },
         KeyCode::Enter => match std::mem::replace(&mut state.overlay, Overlay::None) {
             Overlay::Finder(f) => {
@@ -275,14 +366,23 @@ fn handle_overlay_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) 
                     execute_command_action(state, cmd.action, cmds);
                 }
             }
-            Overlay::Help | Overlay::None => {}
+            Overlay::WorktreeSwitcher(w) => {
+                if let Some(entry) = w.worktrees.get(w.selected) {
+                    if entry.is_current {
+                        set_status(state, "already at this worktree".to_string());
+                    } else {
+                        cmds.push(Cmd::ReRoot(entry.path.clone()));
+                    }
+                }
+            }
+            Overlay::Help | Overlay::GitStatus | Overlay::None => {}
         },
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             match &mut state.overlay {
                 Overlay::Finder(f) => f.push(c),
                 Overlay::Palette(p) => p.push(c),
-                Overlay::Help => state.overlay = Overlay::None,
-                Overlay::None => {}
+                Overlay::Help | Overlay::GitStatus => state.overlay = Overlay::None,
+                Overlay::WorktreeSwitcher(_) | Overlay::None => {}
             }
         }
         _ => {}
@@ -303,6 +403,8 @@ fn execute_command_action(state: &mut AppState, action: CommandAction, cmds: &mu
             set_status(state, "changes: all seen".to_string());
         }
         CommandAction::ShowHelp => state.overlay = Overlay::Help,
+        CommandAction::GitStatus => open_git_status(state),
+        CommandAction::Worktrees => open_worktree_switcher(state),
         CommandAction::Quit => state.quit = true,
     }
 }
@@ -400,9 +502,15 @@ fn cycle_changes(state: &mut AppState, forward: bool, cmds: &mut Vec<Cmd>) {
     }
 }
 
-fn handle_fs_changed(state: &mut AppState, paths: Vec<PathBuf>, _cmds: &mut Vec<Cmd>) {
+fn handle_fs_changed(state: &mut AppState, paths: Vec<PathBuf>, cmds: &mut Vec<Cmd>) {
     let mut touched_anything = false;
     for path in paths {
+        // `.git/` events are noise for the change log but a strong signal that
+        // git state just moved (commit, branch switch, fetch, etc).
+        if path.components().any(|c| c.as_os_str() == ".git") {
+            state.git_dirty = true;
+            continue;
+        }
         if is_noise(&path) {
             continue;
         }
@@ -410,17 +518,19 @@ fn handle_fs_changed(state: &mut AppState, paths: Vec<PathBuf>, _cmds: &mut Vec<
         match path.metadata() {
             Ok(m) if m.is_dir() => continue,
             Ok(_) => {}
-            Err(_) => continue, // nonexistent; is_noise already filters most of these
+            Err(_) => continue,
         }
         state.changes.record(path.clone());
         if let Some(open) = &state.open_file
             && open.path == path
         {
-            _cmds.push(Cmd::LoadFile(path));
+            cmds.push(Cmd::LoadFile(path));
         }
     }
     if touched_anything {
         state.tree_dirty = true;
+        // Non-.git changes can still affect status (new untracked files, etc.).
+        state.git_dirty = true;
     }
 }
 
@@ -460,6 +570,7 @@ pub(crate) fn is_noise(path: &Path) -> bool {
 
 fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<LoadedFile, String>) {
     state.changes.mark_seen(&path);
+    // Reloading a file always invalidates its diff (it's vs HEAD of on-disk bytes).
     match result {
         Ok(loaded) => {
             let preserve_scroll = state
@@ -467,12 +578,20 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 .as_ref()
                 .filter(|f| f.path == path)
                 .map(|f| f.scroll.min(loaded.highlighted.len().saturating_sub(1)));
+            let diff_mode = state
+                .open_file
+                .as_ref()
+                .filter(|f| f.path == path)
+                .is_some_and(|f| f.diff_mode);
             state.open_file = Some(OpenFile {
                 path,
                 text: loaded.text,
                 highlighted: loaded.highlighted,
                 scroll: preserve_scroll.unwrap_or(0),
                 error: None,
+                diff_mode,
+                diff: None,
+                diff_error: None,
             });
             state.focus = Focus::Viewer;
         }
@@ -484,8 +603,47 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 highlighted: Arc::new(Vec::new()),
                 scroll: 0,
                 error: Some(msg.clone()),
+                diff_mode: false,
+                diff: None,
+                diff_error: None,
             });
             set_status(state, msg);
+        }
+    }
+}
+
+fn handle_git_refreshed(state: &mut AppState, result: Result<GitSnapshot, String>) {
+    match result {
+        Ok(snap) => {
+            state.git_snapshot = Some(snap);
+            state.last_git_refresh = Instant::now();
+        }
+        Err(e) => {
+            // Not a git repo, or something else went wrong — drop the snapshot
+            // silently rather than pestering the user. Logs will have details.
+            tracing::debug!(error = %e, "git snapshot failed");
+            state.git_snapshot = None;
+            state.last_git_refresh = Instant::now();
+        }
+    }
+}
+
+fn handle_diff_ready(state: &mut AppState, path: PathBuf, result: Result<Vec<DiffLine>, String>) {
+    // Only apply if the currently-open file still matches; otherwise the user
+    // moved on and this diff is stale.
+    let Some(open) = state.open_file.as_mut() else {
+        return;
+    };
+    if open.path != path {
+        return;
+    }
+    match result {
+        Ok(lines) => {
+            open.diff = Some(Arc::new(lines));
+            open.diff_error = None;
+        }
+        Err(e) => {
+            open.diff_error = Some(e);
         }
     }
 }
@@ -501,21 +659,59 @@ fn handle_tick(state: &mut AppState, cmds: &mut Vec<Cmd>) {
         state.last_tree_rebuild = Instant::now();
         cmds.push(Cmd::RebuildTree);
     }
+    // Git refresh: fire when dirty (after a short settle) OR periodically as a
+    // sweep so we catch external git ops not signalled by fs-watch.
+    let git_elapsed = state.last_git_refresh.elapsed();
+    let should_refresh_git = (state.git_dirty && git_elapsed >= GIT_REFRESH_ON_DIRTY)
+        || git_elapsed >= GIT_REFRESH_MAX_INTERVAL;
+    if should_refresh_git {
+        state.git_dirty = false;
+        state.last_git_refresh = Instant::now();
+        cmds.push(Cmd::RefreshGit);
+    }
 }
 
 fn set_status(state: &mut AppState, msg: String) {
     state.status = Some((msg, Instant::now()));
 }
 
+enum SessionOutcome {
+    Quit,
+    Reroot(PathBuf),
+}
+
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    root: PathBuf,
+    initial_root: PathBuf,
     config: Config,
 ) -> Result<()> {
-    let tree = Tree::build(&root)?;
+    // Pre-warm the syntect OnceLocks once per process so the first real file
+    // open isn't a visible pause. Idempotent across reroot sessions.
+    std::thread::spawn(|| {
+        crate::syntax::highlight_file("", std::path::Path::new("warmup.txt"));
+    });
+
+    let mut root = initial_root;
+    loop {
+        match run_session(terminal, &root, &config).await? {
+            SessionOutcome::Quit => return Ok(()),
+            SessionOutcome::Reroot(new_root) => {
+                tracing::info!(from = %root.display(), to = %new_root.display(), "rerooting");
+                root = new_root;
+            }
+        }
+    }
+}
+
+async fn run_session(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    root: &Path,
+    config: &Config,
+) -> Result<SessionOutcome> {
+    let tree = Tree::build(root)?;
     let mut state = AppState {
-        root: root.clone(),
-        config,
+        root: root.to_path_buf(),
+        config: config.clone(),
         quit: false,
         last_ctrl_c: None,
         tree,
@@ -528,20 +724,18 @@ pub async fn run(
         status: None,
         mouse_layout: MouseLayout::default(),
         overlay: Overlay::None,
+        git_snapshot: None,
+        git_dirty: false,
+        // Back-date so the first tick emits a refresh immediately.
+        last_git_refresh: Instant::now() - GIT_REFRESH_MAX_INTERVAL,
+        reroot_to: None,
     };
 
-    // Pre-warm the syntect OnceLocks so the first real file open isn't a
-    // noticeable pause. Using a plain OS thread since the work is pure CPU
-    // with no tokio affinity and its completion isn't needed by anyone.
-    std::thread::spawn(|| {
-        crate::syntax::highlight_file("", std::path::Path::new("warmup.txt"));
-    });
-
     let mut events = EventLoop::new();
-    let runtime = Runtime::new(events.sender(), root.clone());
-    let _fs_watcher = fs_watch::spawn(root, events.sender())?;
+    let runtime = Runtime::new(events.sender(), root.to_path_buf());
+    let _fs_watcher = fs_watch::spawn(root.to_path_buf(), events.sender())?;
 
-    while !state.quit {
+    while !state.quit && state.reroot_to.is_none() {
         terminal.draw(|f| crate::ui::view(&mut state, f))?;
         let Some(msg) = events.next().await else {
             break;
@@ -551,7 +745,12 @@ pub async fn run(
             runtime.execute(cmd);
         }
     }
-    Ok(())
+
+    if let Some(new_root) = state.reroot_to.take() {
+        Ok(SessionOutcome::Reroot(new_root))
+    } else {
+        Ok(SessionOutcome::Quit)
+    }
 }
 
 #[cfg(test)]
@@ -575,6 +774,10 @@ mod tests {
             status: None,
             mouse_layout: MouseLayout::default(),
             overlay: Overlay::None,
+            git_snapshot: None,
+            git_dirty: false,
+            last_git_refresh: Instant::now(),
+            reroot_to: None,
         }
     }
 
@@ -657,6 +860,9 @@ mod tests {
             highlighted: Arc::new(Vec::new()),
             scroll: 0,
             error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
         });
         let cmds = update(&mut s, Msg::FsChanged(vec![tmpfile.clone()]));
         assert_eq!(s.changes.entries().len(), 1);
@@ -783,6 +989,9 @@ mod tests {
             highlighted: Arc::new(vec![Line::from("1"), Line::from("2"), Line::from("3")]),
             scroll: 0,
             error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
         });
         s.mouse_layout = MouseLayout {
             viewer: Rect {
@@ -871,6 +1080,9 @@ mod tests {
             highlighted: Arc::new(vec![Line::from("1"), Line::from("2"), Line::from("3")]),
             scroll: 0,
             error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
         });
         update(
             &mut s,
@@ -981,6 +1193,169 @@ mod tests {
         } else {
             panic!("overlay should still be finder");
         }
+    }
+
+    #[test]
+    fn fs_change_under_git_sets_git_dirty() {
+        let mut s = fixture();
+        update(
+            &mut s,
+            Msg::FsChanged(vec![PathBuf::from("/tmp/.git/HEAD")]),
+        );
+        assert!(s.git_dirty, "changes under .git/ should mark git_dirty");
+        // And still excluded from the change log.
+        assert_eq!(s.changes.entries().len(), 0);
+    }
+
+    #[test]
+    fn tick_emits_refresh_git_on_dirty_after_throttle() {
+        let mut s = fixture();
+        s.git_dirty = true;
+        s.last_git_refresh = Instant::now() - Duration::from_secs(2);
+        let cmds = update(&mut s, Msg::Tick);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::RefreshGit)));
+    }
+
+    #[test]
+    fn tick_emits_refresh_git_on_5s_sweep_even_if_clean() {
+        let mut s = fixture();
+        s.git_dirty = false;
+        s.last_git_refresh = Instant::now() - Duration::from_secs(6);
+        let cmds = update(&mut s, Msg::Tick);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::RefreshGit)));
+    }
+
+    #[test]
+    fn d_toggles_diff_and_emits_compute_first_time() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/a.rs"),
+            text: String::new(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+        });
+        // First press: enter diff mode + request computation.
+        let cmds = update(&mut s, Msg::Key(plain('d')));
+        assert!(s.open_file.as_ref().unwrap().diff_mode);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::ComputeDiff(p) if p == &PathBuf::from("/tmp/a.rs")))
+        );
+        // Second press: exit diff mode, no new command.
+        let cmds = update(&mut s, Msg::Key(plain('d')));
+        assert!(!s.open_file.as_ref().unwrap().diff_mode);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn d_without_open_file_is_noop_with_status() {
+        let mut s = fixture();
+        let cmds = update(&mut s, Msg::Key(plain('d')));
+        assert!(cmds.is_empty());
+        assert!(s.status.is_some());
+    }
+
+    #[test]
+    fn g_opens_git_status_when_snapshot_present() {
+        let mut s = fixture();
+        s.git_snapshot = Some(GitSnapshot::default());
+        update(&mut s, Msg::Key(plain('g')));
+        assert!(matches!(s.overlay, Overlay::GitStatus));
+    }
+
+    #[test]
+    fn g_without_snapshot_shows_status() {
+        let mut s = fixture();
+        update(&mut s, Msg::Key(plain('g')));
+        assert!(matches!(s.overlay, Overlay::None));
+        assert!(s.status.is_some());
+    }
+
+    #[test]
+    fn b_opens_worktree_switcher_with_current_preselected() {
+        let mut s = fixture();
+        let wts = vec![
+            crate::git::WorktreeEntry {
+                path: PathBuf::from("/a"),
+                branch: None,
+                is_current: false,
+            },
+            crate::git::WorktreeEntry {
+                path: PathBuf::from("/b"),
+                branch: None,
+                is_current: true,
+            },
+        ];
+        s.git_snapshot = Some(GitSnapshot {
+            worktrees: wts,
+            ..Default::default()
+        });
+        update(&mut s, Msg::Key(plain('b')));
+        match &s.overlay {
+            Overlay::WorktreeSwitcher(w) => assert_eq!(w.selected, 1),
+            _ => panic!("expected WorktreeSwitcher overlay"),
+        }
+    }
+
+    #[test]
+    fn worktree_switcher_enter_on_current_is_noop_with_status() {
+        let mut s = fixture();
+        let wts = vec![crate::git::WorktreeEntry {
+            path: PathBuf::from("/a"),
+            branch: None,
+            is_current: true,
+        }];
+        s.overlay = Overlay::WorktreeSwitcher(WorktreeSwitcherState::new(wts));
+        let cmds = update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(cmds.is_empty());
+        assert!(s.status.is_some());
+        assert!(matches!(s.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn worktree_switcher_enter_on_other_emits_reroot() {
+        let mut s = fixture();
+        let wts = vec![
+            crate::git::WorktreeEntry {
+                path: PathBuf::from("/a"),
+                branch: None,
+                is_current: false,
+            },
+            crate::git::WorktreeEntry {
+                path: PathBuf::from("/b"),
+                branch: None,
+                is_current: true,
+            },
+        ];
+        s.overlay = Overlay::WorktreeSwitcher(WorktreeSwitcherState::new(wts));
+        // Currently selected is /b (is_current). Move up to /a, then Enter.
+        update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        );
+        let cmds = update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::ReRoot(p) if p == &PathBuf::from("/a"))),
+            "expected Cmd::ReRoot(/a)"
+        );
+    }
+
+    #[test]
+    fn reroot_requested_sets_flag_for_run_session() {
+        let mut s = fixture();
+        update(&mut s, Msg::ReRootRequested(PathBuf::from("/new")));
+        assert_eq!(s.reroot_to, Some(PathBuf::from("/new")));
     }
 
     #[test]

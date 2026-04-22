@@ -5,7 +5,7 @@ use tracing::{debug, warn};
 
 use crate::{
     app::{Cmd, LoadedFile, Msg},
-    syntax, tree,
+    git, syntax, tree,
 };
 
 /// Executes side-effecting `Cmd`s emitted by `update`. Results come back as
@@ -25,7 +25,44 @@ impl Runtime {
         match cmd {
             Cmd::LoadFile(path) => self.spawn_load_file(path),
             Cmd::RebuildTree => self.spawn_rebuild_tree(),
+            Cmd::RefreshGit => self.spawn_refresh_git(),
+            Cmd::ComputeDiff(path) => self.spawn_compute_diff(path),
+            Cmd::ReRoot(new_root) => {
+                // Just echo the request back to update() — app::run_session
+                // observes this and returns SessionOutcome::Reroot.
+                let _ = self.tx.send(Msg::ReRootRequested(new_root));
+            }
         }
+    }
+
+    fn spawn_refresh_git(&self) {
+        let tx = self.tx.clone();
+        let root = self.root.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || git::snapshot(&root)).await;
+            let msg = match result {
+                Ok(Ok(snap)) => Msg::GitRefreshed(Ok(snap)),
+                Ok(Err(e)) => Msg::GitRefreshed(Err(e.to_string())),
+                Err(e) => Msg::GitRefreshed(Err(format!("git snapshot task panicked: {e}"))),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn spawn_compute_diff(&self, path: PathBuf) {
+        let tx = self.tx.clone();
+        let root = self.root.clone();
+        tokio::spawn(async move {
+            let path_for_task = path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || git::diff_vs_head(&root, &path_for_task)).await;
+            let result = match result {
+                Ok(Ok(lines)) => Ok(lines),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("diff task panicked: {e}")),
+            };
+            let _ = tx.send(Msg::DiffReady { path, result });
+        });
     }
 
     fn spawn_rebuild_tree(&self) {

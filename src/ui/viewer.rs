@@ -22,7 +22,13 @@ fn render_header(state: &AppState, area: Rect, frame: &mut Frame) {
     let text = match &state.open_file {
         Some(f) => {
             let relative = f.path.strip_prefix(&state.root).unwrap_or(f.path.as_path());
-            let marker = if f.error.is_some() { " [error]" } else { "" };
+            let marker = if f.error.is_some() {
+                " [error]"
+            } else if f.diff_mode {
+                " [diff vs HEAD]"
+            } else {
+                ""
+            };
             format!(" {}{}", relative.display(), marker)
         }
         None => " (no file open — press Tab then Enter on a file in the tree)".to_string(),
@@ -74,6 +80,11 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
         return;
     }
 
+    if open.diff_mode {
+        render_diff(open, inner, frame);
+        return;
+    }
+
     let gutter_width = gutter_width_for(open);
     let gutter_area = Rect {
         x: inner.x,
@@ -108,6 +119,58 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
 
     let body: Vec<Line> = open.highlighted[start..end].to_vec();
     frame.render_widget(Paragraph::new(body), content_area);
+}
+
+fn render_diff(open: &OpenFile, area: Rect, frame: &mut Frame) {
+    if let Some(err) = &open.diff_error {
+        let p = Paragraph::new(Line::from(Span::styled(
+            format!("diff failed: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+        frame.render_widget(p, area);
+        return;
+    }
+    let Some(diff) = &open.diff else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "computing diff…",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(p, area);
+        return;
+    };
+    if diff.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "no changes vs HEAD",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(p, area);
+        return;
+    }
+
+    use crate::git::DiffLineKind;
+    let lines: Vec<Line> = diff
+        .iter()
+        .skip(open.scroll)
+        .take(area.height as usize)
+        .map(|dl| {
+            let (prefix, style) = match dl.kind {
+                DiffLineKind::HunkHeader => (
+                    "   ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                DiffLineKind::Added => (" + ", Style::default().fg(Color::Green)),
+                DiffLineKind::Removed => (" - ", Style::default().fg(Color::Red)),
+                DiffLineKind::Context => ("   ", Style::default().fg(Color::Gray)),
+            };
+            Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(dl.content.clone(), style),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn gutter_width_for(open: &OpenFile) -> u16 {

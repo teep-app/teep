@@ -16,6 +16,8 @@ pub enum CommandAction {
     RefreshTree,
     CheckpointChanges,
     ShowHelp,
+    GitStatus,
+    Worktrees,
     Quit,
 }
 
@@ -34,6 +36,16 @@ pub const COMMANDS: &[Command] = &[
         name: "sidebar",
         description: "Show or hide the sidebar",
         action: CommandAction::ToggleSidebar,
+    },
+    Command {
+        name: "git",
+        description: "Show git status overlay",
+        action: CommandAction::GitStatus,
+    },
+    Command {
+        name: "worktrees",
+        description: "Switch to another git worktree",
+        action: CommandAction::Worktrees,
     },
     Command {
         name: "help",

@@ -5,6 +5,7 @@ mod config;
 mod event;
 mod finder;
 mod fs_watch;
+mod git;
 mod runtime;
 mod syntax;
 mod tree;

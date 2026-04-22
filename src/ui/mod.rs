@@ -65,32 +65,66 @@ fn render_header(state: &AppState, area: ratatui::layout::Rect, frame: &mut Fram
         .and_then(|s| s.to_str())
         .unwrap_or("");
     let unseen = state.changes.unseen_count();
-    let spans = vec![
-        Span::styled(
-            " hitled ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(root_label, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
-        Span::styled(
-            state.root.display().to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("  "),
-        if unseen == 0 {
-            Span::styled("no new changes", Style::default().fg(Color::DarkGray))
+
+    let mut spans: Vec<Span<'_>> = vec![Span::styled(
+        " hitled ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+
+    // Git dot + branch, if we have a snapshot.
+    if let Some(snap) = state.git_snapshot.as_ref() {
+        let conflict = snap
+            .status
+            .iter()
+            .any(|s| matches!(s.kind, crate::git::StatusKind::Conflicted));
+        let dot_color = if conflict {
+            Color::Red
+        } else if snap.is_clean {
+            Color::DarkGray
         } else {
-            Span::styled(
-                format!("● {unseen} new"),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        },
-    ];
+            Color::Yellow
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("●", Style::default().fg(dot_color)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            snap.branch.clone().unwrap_or_else(|| "(detached)".into()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        // If the session root is not itself the worktree root, indicate.
+        if let Some(wt_name) = snap.worktree_path.file_name().and_then(|s| s.to_str()) {
+            spans.push(Span::styled(
+                format!(" · wt:{wt_name}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    } else {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            root_label,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        state.root.display().to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(if unseen == 0 {
+        Span::styled("no new changes", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled(
+            format!("● {unseen} new"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
+
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
