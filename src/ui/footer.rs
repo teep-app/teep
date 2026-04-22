@@ -6,7 +6,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::app::{AppState, Focus};
+use crate::app::{AppState, EditState, Focus};
 
 pub fn render(state: &AppState, area: Rect, frame: &mut Frame) {
     if state.overlay.is_active() {
@@ -34,6 +34,40 @@ pub fn render(state: &AppState, area: Rect, frame: &mut Frame) {
         )));
         frame.render_widget(p, area);
         return;
+    }
+
+    // Edit / conflict / deleted hint strips override the normal footer.
+    if let Some(open) = state.open_file.as_ref() {
+        let edit_hints: Option<Vec<Span>> = match &open.edit {
+            EditState::Edit(b) => Some(vec![
+                hint("Ctrl-S", "save"),
+                sep(),
+                hint("Esc", if b.is_dirty() { "discard+exit" } else { "exit" }),
+                sep(),
+                hint("Ctrl-C×2", "quit"),
+            ]),
+            EditState::Conflict { .. } => Some(vec![
+                hint("k", "keep mine"),
+                sep(),
+                hint("t", "take theirs"),
+                sep(),
+                hint("Esc", "keep mine"),
+                sep(),
+                hint("Ctrl-C×2", "quit"),
+            ]),
+            EditState::Deleted { .. } => Some(vec![
+                hint("r", "restore from buffer"),
+                sep(),
+                hint("c", "close"),
+                sep(),
+                hint("Ctrl-C×2", "quit"),
+            ]),
+            EditState::View => None,
+        };
+        if let Some(spans) = edit_hints {
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
     }
 
     let unseen = state.changes.unseen_count();
@@ -64,7 +98,7 @@ pub fn render(state: &AppState, area: Rect, frame: &mut Frame) {
         Focus::Viewer => vec![
             hint("↑↓", "scroll"),
             sep(),
-            hint("PgUp/PgDn", "page"),
+            hint("i", "edit"),
             sep(),
             hint("d", "diff"),
             sep(),

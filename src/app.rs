@@ -8,6 +8,7 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect, text::Line};
+use tui_textarea::{Input, TextArea};
 
 use crate::{
     changes::ChangeLog,
@@ -48,6 +49,11 @@ pub struct AppState {
     /// Set by `Msg::ReRootRequested`; the outer `run` loop observes this and
     /// restarts the session at the new path.
     pub reroot_to: Option<PathBuf>,
+
+    // M5: edit mode — when we save via Cmd::SaveFile, the fs-watcher fires an
+    // event for our own write. Suppress exactly one fs-change on that path so
+    // it doesn't trip the conflict banner.
+    pub ignore_next_fs_change: Option<PathBuf>,
 }
 
 /// Modal overlays that steal keyboard focus. Triggered by `/`, `:`, `?`, `g`, `b`.
@@ -110,7 +116,6 @@ pub enum Focus {
 
 pub struct OpenFile {
     pub path: PathBuf,
-    #[allow(dead_code)] // full text retained for edit mode (M5)
     pub text: String,
     pub highlighted: Arc<Vec<Line<'static>>>,
     pub scroll: usize,
@@ -120,6 +125,46 @@ pub struct OpenFile {
     pub diff_mode: bool,
     pub diff: Option<Arc<Vec<DiffLine>>>,
     pub diff_error: Option<String>,
+
+    // M5: edit state
+    pub edit: EditState,
+}
+
+#[derive(Default)]
+pub enum EditState {
+    #[default]
+    View,
+    Edit(EditBuffer),
+    Conflict {
+        buffer: EditBuffer,
+    },
+    Deleted {
+        buffer: EditBuffer,
+    },
+}
+
+pub struct EditBuffer {
+    pub textarea: TextArea<'static>,
+    /// Text as it was on disk when we entered (or last saved) — used to detect "dirty".
+    pub base_text: String,
+}
+
+impl EditBuffer {
+    pub fn new(initial: &str) -> Self {
+        let lines: Vec<String> = initial.split('\n').map(|s| s.to_string()).collect();
+        Self {
+            textarea: TextArea::new(lines),
+            base_text: initial.to_string(),
+        }
+    }
+
+    pub fn current_text(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.current_text() != self.base_text
+    }
 }
 
 pub struct LoadedFile {
@@ -137,6 +182,10 @@ pub enum Msg {
         path: PathBuf,
         result: Result<LoadedFile, String>,
     },
+    FileSaved {
+        path: PathBuf,
+        result: Result<(), String>,
+    },
     TreeRebuilt(tree::Node),
     GitRefreshed(Result<GitSnapshot, String>),
     DiffReady {
@@ -147,8 +196,10 @@ pub enum Msg {
     Tick,
 }
 
+#[derive(Debug)]
 pub enum Cmd {
     LoadFile(PathBuf),
+    SaveFile { path: PathBuf, content: String },
     RebuildTree,
     RefreshGit,
     ComputeDiff(PathBuf),
@@ -169,6 +220,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
         Msg::Mouse(ev) => handle_mouse(state, ev, &mut cmds),
         Msg::FsChanged(paths) => handle_fs_changed(state, paths, &mut cmds),
         Msg::FileLoaded { path, result } => handle_file_loaded(state, path, result),
+        Msg::FileSaved { path, result } => handle_file_saved(state, path, result),
         Msg::TreeRebuilt(node) => state.tree.graft(node),
         Msg::GitRefreshed(result) => handle_git_refreshed(state, result),
         Msg::DiffReady { path, result } => handle_diff_ready(state, path, result),
@@ -191,6 +243,29 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
     if state.overlay.is_active() {
         handle_overlay_key(state, key, cmds);
         return;
+    }
+
+    // Edit mode + banner states own the keyboard next.
+    let edit_kind = state.open_file.as_ref().map(|f| match &f.edit {
+        EditState::View => 0u8,
+        EditState::Edit(_) => 1,
+        EditState::Conflict { .. } => 2,
+        EditState::Deleted { .. } => 3,
+    });
+    match edit_kind {
+        Some(1) => {
+            handle_edit_key(state, key, cmds);
+            return;
+        }
+        Some(2) => {
+            handle_conflict_key(state, key, cmds);
+            return;
+        }
+        Some(3) => {
+            handle_deleted_key(state, key, cmds);
+            return;
+        }
+        _ => {}
     }
 
     // Open an overlay.
@@ -238,10 +313,143 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
         (KeyCode::Char('d'), _) => toggle_diff(state, cmds),
         (KeyCode::Char('g'), _) => open_git_status(state),
         (KeyCode::Char('b'), _) => open_worktree_switcher(state),
+        (KeyCode::Char('i'), _) | (KeyCode::Char('e'), _) => enter_edit_mode(state),
         _ => match state.focus {
             Focus::Tree => handle_tree_key(state, key, cmds),
             Focus::Viewer => handle_viewer_key(state, key),
         },
+    }
+}
+
+fn enter_edit_mode(state: &mut AppState) {
+    let Some(open) = state.open_file.as_mut() else {
+        set_status(state, "no file open".to_string());
+        return;
+    };
+    if open.error.is_some() {
+        set_status(state, "cannot edit: file has errors".to_string());
+        return;
+    }
+    if !matches!(open.edit, EditState::View) {
+        return;
+    }
+    // Edit and diff are mutually exclusive views.
+    open.diff_mode = false;
+    let buffer = EditBuffer::new(&open.text);
+    open.edit = EditState::Edit(buffer);
+    state.focus = Focus::Viewer;
+}
+
+fn handle_edit_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
+    if key.code == KeyCode::Esc {
+        // Exit edit mode. If dirty, discard changes (user must Ctrl-S to save).
+        let Some(open) = state.open_file.as_mut() else {
+            return;
+        };
+        let was_dirty = match &open.edit {
+            EditState::Edit(b) => b.is_dirty(),
+            _ => false,
+        };
+        open.edit = EditState::View;
+        if was_dirty {
+            set_status(state, "discarded unsaved edits".to_string());
+        }
+        return;
+    }
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        save_current(state, cmds);
+        return;
+    }
+    // Everything else flows into the text area.
+    let Some(open) = state.open_file.as_mut() else {
+        return;
+    };
+    if let EditState::Edit(buffer) = &mut open.edit {
+        let input: Input = Input::from(key);
+        buffer.textarea.input(input);
+    }
+}
+
+fn save_current(state: &mut AppState, cmds: &mut Vec<Cmd>) {
+    let Some(open) = state.open_file.as_mut() else {
+        return;
+    };
+    let EditState::Edit(buffer) = &mut open.edit else {
+        return;
+    };
+    let mut content = buffer.current_text();
+    // Conventionally, text files end with a newline; respect base_text's convention.
+    if !content.ends_with('\n') && buffer.base_text.ends_with('\n') {
+        content.push('\n');
+    }
+    // Update base so our own fs-event doesn't look like a conflict.
+    buffer.base_text = content.clone();
+    let path = open.path.clone();
+    state.ignore_next_fs_change = Some(path.clone());
+    cmds.push(Cmd::SaveFile { path, content });
+}
+
+fn handle_conflict_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
+    let Some(open) = state.open_file.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Char('k') | KeyCode::Esc => {
+            // Keep my edits; continue editing. Next save will clobber the agent's write.
+            if let EditState::Conflict { buffer } = std::mem::take(&mut open.edit) {
+                open.edit = EditState::Edit(buffer);
+            }
+            set_status(state, "kept your edits".to_string());
+        }
+        KeyCode::Char('t') => {
+            // Take theirs: discard edits, reload.
+            open.edit = EditState::View;
+            let path = open.path.clone();
+            cmds.push(Cmd::LoadFile(path));
+            set_status(state, "reloaded from disk".to_string());
+        }
+        _ => {}
+    }
+}
+
+fn handle_deleted_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
+    match key.code {
+        KeyCode::Char('r') => {
+            let Some(open) = state.open_file.as_mut() else {
+                return;
+            };
+            let EditState::Deleted { buffer } = std::mem::take(&mut open.edit) else {
+                return;
+            };
+            let content = buffer.current_text();
+            let path = open.path.clone();
+            state.ignore_next_fs_change = Some(path.clone());
+            cmds.push(Cmd::SaveFile {
+                path,
+                content: content.clone(),
+            });
+            // Go back to edit mode with the rewritten file as our new base.
+            let mut new_buffer = EditBuffer::new(&content);
+            new_buffer.base_text = content;
+            open.edit = EditState::Edit(new_buffer);
+            set_status(state, "restoring file...".to_string());
+        }
+        KeyCode::Char('c') | KeyCode::Esc => {
+            state.open_file = None;
+            set_status(state, "closed".to_string());
+        }
+        _ => {}
+    }
+}
+
+fn handle_file_saved(state: &mut AppState, path: PathBuf, result: Result<(), String>) {
+    match result {
+        Ok(()) => set_status(state, format!("saved {}", path.display())),
+        Err(e) => {
+            // Our suppression is no longer valid since the write didn't land.
+            state.ignore_next_fs_change = None;
+            set_status(state, format!("save failed: {e}"));
+        }
     }
 }
 
@@ -505,8 +713,7 @@ fn cycle_changes(state: &mut AppState, forward: bool, cmds: &mut Vec<Cmd>) {
 fn handle_fs_changed(state: &mut AppState, paths: Vec<PathBuf>, cmds: &mut Vec<Cmd>) {
     let mut touched_anything = false;
     for path in paths {
-        // `.git/` events are noise for the change log but a strong signal that
-        // git state just moved (commit, branch switch, fetch, etc).
+        // `.git/` events are change-log noise but a strong git-refresh signal.
         if path.components().any(|c| c.as_os_str() == ".git") {
             state.git_dirty = true;
             continue;
@@ -514,30 +721,80 @@ fn handle_fs_changed(state: &mut AppState, paths: Vec<PathBuf>, cmds: &mut Vec<C
         if is_noise(&path) {
             continue;
         }
-        touched_anything = true;
-        match path.metadata() {
-            Ok(m) if m.is_dir() => continue,
-            Ok(_) => {}
-            Err(_) => continue,
+
+        // Skip fs events we triggered ourselves via Cmd::SaveFile so our own
+        // write doesn't look like an external conflict.
+        if state.ignore_next_fs_change.as_ref() == Some(&path) {
+            state.ignore_next_fs_change = None;
+            continue;
         }
+
+        let metadata = path.metadata();
+        let exists = metadata.is_ok();
+        let is_dir = matches!(metadata, Ok(ref m) if m.is_dir());
+
+        if !exists {
+            // Only meaningful when the vanished path is the currently-open file.
+            // Otherwise it's almost always an atomic-rename artifact and the
+            // follow-up event gives us the real file.
+            if state.open_file.as_ref().is_some_and(|f| f.path == path) {
+                handle_open_file_deleted(state);
+            }
+            continue;
+        }
+        if is_dir {
+            continue;
+        }
+
+        touched_anything = true;
         state.changes.record(path.clone());
-        if let Some(open) = &state.open_file
+
+        if let Some(open) = state.open_file.as_mut()
             && open.path == path
         {
-            cmds.push(Cmd::LoadFile(path));
+            match std::mem::take(&mut open.edit) {
+                EditState::Edit(buffer) | EditState::Conflict { buffer } => {
+                    // Any external write while we're mid-edit is a conflict.
+                    open.edit = EditState::Conflict { buffer };
+                }
+                EditState::Deleted { buffer } => {
+                    // File came back via a non-self-save event — treat as conflict.
+                    open.edit = EditState::Conflict { buffer };
+                }
+                EditState::View => {
+                    open.edit = EditState::View;
+                    cmds.push(Cmd::LoadFile(path));
+                }
+            }
         }
     }
     if touched_anything {
         state.tree_dirty = true;
-        // Non-.git changes can still affect status (new untracked files, etc.).
         state.git_dirty = true;
     }
 }
 
+fn handle_open_file_deleted(state: &mut AppState) {
+    let Some(open) = state.open_file.as_mut() else {
+        return;
+    };
+    match std::mem::take(&mut open.edit) {
+        EditState::Edit(buffer) | EditState::Conflict { buffer } => {
+            open.edit = EditState::Deleted { buffer };
+        }
+        EditState::Deleted { buffer } => {
+            open.edit = EditState::Deleted { buffer };
+        }
+        EditState::View => {
+            set_status(state, "file removed on disk".to_string());
+            state.open_file = None;
+        }
+    }
+}
+
 /// Returns true for fs events we should not record or act on: dotfiles,
-/// `.git/*`, common editor atomic-rename temp files, paths that no longer
-/// exist. Matches the filtering behavior of `tree::build_node`
-/// (which uses `WalkBuilder::hidden(true)` + `.git_ignore(true)`).
+/// `.git/*`, common editor atomic-rename temp files. Existence is handled by
+/// the caller so deletion of the open file can be observed.
 pub(crate) fn is_noise(path: &Path) -> bool {
     for c in path.components() {
         let bytes = c.as_os_str().as_encoded_bytes();
@@ -560,9 +817,6 @@ pub(crate) fn is_noise(path: &Path) -> bool {
         return true;
     }
     if name.starts_with(".#") {
-        return true;
-    }
-    if !path.exists() {
         return true;
     }
     false
@@ -596,6 +850,7 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff_mode,
                 diff: None,
                 diff_error: None,
+                edit: EditState::View,
             });
             state.focus = Focus::Viewer;
             if is_reload {
@@ -613,6 +868,7 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
                 diff_mode: false,
                 diff: None,
                 diff_error: None,
+                edit: EditState::View,
             });
             set_status(state, msg);
         }
@@ -736,6 +992,7 @@ async fn run_session(
         // Back-date so the first tick emits a refresh immediately.
         last_git_refresh: Instant::now() - GIT_REFRESH_MAX_INTERVAL,
         reroot_to: None,
+        ignore_next_fs_change: None,
     };
 
     let mut events = EventLoop::new();
@@ -785,6 +1042,7 @@ mod tests {
             git_dirty: false,
             last_git_refresh: Instant::now(),
             reroot_to: None,
+            ignore_next_fs_change: None,
         }
     }
 
@@ -870,6 +1128,7 @@ mod tests {
             diff_mode: false,
             diff: None,
             diff_error: None,
+            edit: EditState::View,
         });
         let cmds = update(&mut s, Msg::FsChanged(vec![tmpfile.clone()]));
         assert_eq!(s.changes.entries().len(), 1);
@@ -898,9 +1157,11 @@ mod tests {
         assert!(is_noise(Path::new("/tmp/foo~")));
         assert!(is_noise(Path::new("/tmp/.foo.swp")));
         assert!(is_noise(Path::new("/tmp/.#emacslock")));
+        // Nonexistent-but-otherwise-ok paths are NOT noise — handle_fs_changed
+        // handles them as deletions of the open file.
         assert!(
-            is_noise(Path::new("/tmp/definitely_does_not_exist_hitled_test.rs")),
-            "nonexistent paths are noise"
+            !is_noise(Path::new("/tmp/definitely_does_not_exist_hitled_test.rs")),
+            "nonexistent paths are handled by handle_fs_changed, not is_noise"
         );
     }
 
@@ -999,6 +1260,7 @@ mod tests {
             diff_mode: false,
             diff: None,
             diff_error: None,
+            edit: EditState::View,
         });
         s.mouse_layout = MouseLayout {
             viewer: Rect {
@@ -1090,6 +1352,7 @@ mod tests {
             diff_mode: false,
             diff: None,
             diff_error: None,
+            edit: EditState::View,
         });
         update(
             &mut s,
@@ -1244,6 +1507,7 @@ mod tests {
             diff_mode: false,
             diff: None,
             diff_error: None,
+            edit: EditState::View,
         });
         // First press: enter diff mode + request computation.
         let cmds = update(&mut s, Msg::Key(plain('d')));
@@ -1370,6 +1634,7 @@ mod tests {
             diff_mode: false,
             diff: None,
             diff_error: None,
+            edit: EditState::View,
         });
         update(
             &mut s,
@@ -1404,6 +1669,162 @@ mod tests {
             s.status.is_none(),
             "first-time open should not flash reloaded"
         );
+    }
+
+    fn edit_test_path(suffix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hitled_edit_{}_{}.rs", std::process::id(), suffix))
+    }
+
+    fn open_file_with_text(text: &str, path: PathBuf) -> OpenFile {
+        OpenFile {
+            path,
+            text: text.to_string(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+        }
+    }
+
+    #[test]
+    fn i_enters_edit_mode() {
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text(
+            "hello\nworld\n",
+            edit_test_path("i_enters"),
+        ));
+        update(&mut s, Msg::Key(plain('i')));
+        match &s.open_file.as_ref().unwrap().edit {
+            EditState::Edit(_) => {}
+            _ => panic!("expected Edit state"),
+        }
+    }
+
+    #[test]
+    fn esc_exits_edit_mode_and_reports_discard_when_dirty() {
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("hello\n", edit_test_path("esc_exits")));
+        update(&mut s, Msg::Key(plain('i')));
+        // Type something to dirty the buffer.
+        if let EditState::Edit(b) = &mut s.open_file.as_mut().unwrap().edit {
+            b.textarea.insert_char('x');
+            assert!(b.is_dirty());
+        }
+        update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        assert!(matches!(
+            s.open_file.as_ref().unwrap().edit,
+            EditState::View
+        ));
+        assert!(s.status.is_some(), "discard should produce a status toast");
+    }
+
+    #[test]
+    fn ctrl_s_emits_savefile_with_current_content_and_arms_suppression() {
+        let path = edit_test_path("ctrl_s");
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("hi\n", path.clone()));
+        update(&mut s, Msg::Key(plain('i')));
+        if let EditState::Edit(b) = &mut s.open_file.as_mut().unwrap().edit {
+            b.textarea.insert_char('!');
+        }
+        let cmds = update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SaveFile { .. })),
+            "expected Cmd::SaveFile, got {cmds:?}",
+        );
+        assert_eq!(s.ignore_next_fs_change.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn fs_change_during_edit_transitions_to_conflict() {
+        let p = edit_test_path("conflict");
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("hello\n", p.clone()));
+        update(&mut s, Msg::Key(plain('i')));
+        std::fs::write(&p, b"external\n").unwrap();
+        update(&mut s, Msg::FsChanged(vec![p.clone()]));
+        assert!(matches!(
+            s.open_file.as_ref().unwrap().edit,
+            EditState::Conflict { .. }
+        ));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn fs_change_after_self_save_is_suppressed() {
+        let p = edit_test_path("self_save");
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("hello\n", p.clone()));
+        update(&mut s, Msg::Key(plain('i')));
+        std::fs::write(&p, b"hello\n").unwrap();
+        s.ignore_next_fs_change = Some(p.clone());
+        update(&mut s, Msg::FsChanged(vec![p.clone()]));
+        assert!(
+            matches!(s.open_file.as_ref().unwrap().edit, EditState::Edit(_)),
+            "own save must not trigger conflict"
+        );
+        assert!(s.ignore_next_fs_change.is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn conflict_k_keeps_mine_and_returns_to_edit() {
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("hello\n", edit_test_path("conflict_k")));
+        let buffer = EditBuffer::new("hello\n");
+        s.open_file.as_mut().unwrap().edit = EditState::Conflict { buffer };
+        update(&mut s, Msg::Key(plain('k')));
+        assert!(matches!(
+            s.open_file.as_ref().unwrap().edit,
+            EditState::Edit(_)
+        ));
+    }
+
+    #[test]
+    fn conflict_t_emits_loadfile_and_returns_to_view() {
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("hello\n", edit_test_path("conflict_t")));
+        let buffer = EditBuffer::new("hello\n");
+        s.open_file.as_mut().unwrap().edit = EditState::Conflict { buffer };
+        let cmds = update(&mut s, Msg::Key(plain('t')));
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::LoadFile(_))));
+        assert!(matches!(
+            s.open_file.as_ref().unwrap().edit,
+            EditState::View
+        ));
+    }
+
+    #[test]
+    fn deleted_r_saves_buffer_and_returns_to_edit() {
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("hello\n", edit_test_path("deleted_r")));
+        let buffer = EditBuffer::new("hello\n");
+        s.open_file.as_mut().unwrap().edit = EditState::Deleted { buffer };
+        let cmds = update(&mut s, Msg::Key(plain('r')));
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SaveFile { .. })));
+        assert!(matches!(
+            s.open_file.as_ref().unwrap().edit,
+            EditState::Edit(_)
+        ));
+    }
+
+    #[test]
+    fn deleted_c_closes_open_file() {
+        let mut s = fixture();
+        s.open_file = Some(open_file_with_text("hello\n", edit_test_path("deleted_c")));
+        let buffer = EditBuffer::new("hello\n");
+        s.open_file.as_mut().unwrap().edit = EditState::Deleted { buffer };
+        update(&mut s, Msg::Key(plain('c')));
+        assert!(s.open_file.is_none());
     }
 
     #[test]

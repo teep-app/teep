@@ -40,6 +40,9 @@ nucleo-matcher = "0.3"
 gix = "0.81"
 similar = "2"
 
+# M5: edit mode
+tui-textarea = "0.7"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -24,6 +24,7 @@ impl Runtime {
     pub fn execute(&self, cmd: Cmd) {
         match cmd {
             Cmd::LoadFile(path) => self.spawn_load_file(path),
+            Cmd::SaveFile { path, content } => self.spawn_save_file(path, content),
             Cmd::RebuildTree => self.spawn_rebuild_tree(),
             Cmd::RefreshGit => self.spawn_refresh_git(),
             Cmd::ComputeDiff(path) => self.spawn_compute_diff(path),
@@ -33,6 +34,17 @@ impl Runtime {
                 let _ = self.tx.send(Msg::ReRootRequested(new_root));
             }
         }
+    }
+
+    fn spawn_save_file(&self, path: PathBuf, content: String) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            debug!(?path, bytes = content.len(), "saving file");
+            let result = tokio::fs::write(&path, content.as_bytes())
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::FileSaved { path, result });
+        });
     }
 
     fn spawn_refresh_git(&self) {

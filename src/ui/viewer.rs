@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::app::{AppState, Focus, OpenFile};
+use crate::app::{AppState, EditState, Focus, OpenFile};
 
 pub fn render(state: &AppState, area: Rect, frame: &mut Frame) {
     let chunks = Layout::default()
@@ -24,6 +24,16 @@ fn render_header(state: &AppState, area: Rect, frame: &mut Frame) {
             let relative = f.path.strip_prefix(&state.root).unwrap_or(f.path.as_path());
             let marker = if f.error.is_some() {
                 " [error]"
+            } else if matches!(f.edit, EditState::Deleted { .. }) {
+                " [file removed]"
+            } else if let EditState::Edit(b) = &f.edit {
+                if b.is_dirty() {
+                    " [edit · unsaved]"
+                } else {
+                    " [edit]"
+                }
+            } else if matches!(f.edit, EditState::Conflict { .. }) {
+                " [edit · conflict]"
             } else if f.diff_mode {
                 " [diff vs HEAD]"
             } else {
@@ -78,6 +88,22 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
         )));
         frame.render_widget(p, inner);
         return;
+    }
+
+    match &open.edit {
+        EditState::Edit(buffer) => {
+            render_edit(buffer, inner, frame);
+            return;
+        }
+        EditState::Conflict { buffer } => {
+            render_conflict(buffer, inner, frame);
+            return;
+        }
+        EditState::Deleted { buffer } => {
+            render_deleted(buffer, inner, frame);
+            return;
+        }
+        EditState::View => {}
     }
 
     if open.diff_mode {
@@ -171,6 +197,49 @@ fn render_diff(open: &OpenFile, area: Rect, frame: &mut Frame) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_edit(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
+    frame.render_widget(&buffer.textarea, area);
+}
+
+fn banner<'a>(text: &'a str, fg: Color, bg: Color) -> Paragraph<'a> {
+    Paragraph::new(Line::from(Span::styled(
+        format!(" {text} "),
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+    )))
+}
+
+fn render_conflict(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+    frame.render_widget(
+        banner(
+            "⚠ agent modified this file on disk · [k]eep mine · [t]heirs · Esc to keep",
+            Color::Black,
+            Color::Yellow,
+        ),
+        split[0],
+    );
+    frame.render_widget(&buffer.textarea, split[1]);
+}
+
+fn render_deleted(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+    frame.render_widget(
+        banner(
+            "⚠ file removed on disk · [r]estore from buffer · [c]lose",
+            Color::White,
+            Color::Red,
+        ),
+        split[0],
+    );
+    frame.render_widget(&buffer.textarea, split[1]);
 }
 
 fn gutter_width_for(open: &OpenFile) -> u16 {
