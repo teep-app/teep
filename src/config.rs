@@ -21,7 +21,7 @@ impl Default for Config {
 }
 
 fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("", "", "hitled")
+    ProjectDirs::from("", "", "teep")
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -48,10 +48,10 @@ pub fn init_logging() -> Result<WorkerGuard> {
     let dir = log_dir().ok_or_else(|| anyhow!("could not determine log directory"))?;
     fs::create_dir_all(&dir).with_context(|| format!("creating log dir {}", dir.display()))?;
 
-    let file_appender = tracing_appender::rolling::never(&dir, "hitled.log");
+    let file_appender = tracing_appender::rolling::never(&dir, "teep.log");
     let (writer, guard) = tracing_appender::non_blocking(file_appender);
 
-    let filter = EnvFilter::try_from_env("HITLED_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_env("TEEP_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(filter)

@@ -392,6 +392,11 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
     }
 }
 
+/// Narrow-pane threshold: below this width the banner collapses to its
+/// short form. Relevant keybindings are always surfaced redundantly in
+/// the footer, so the banner can safely shrink.
+const NARROW_BANNER_WIDTH: u16 = 60;
+
 fn banner<'a>(text: &'a str, fg: Color, bg: Color) -> Paragraph<'a> {
     Paragraph::new(Line::from(Span::styled(
         format!(" {text} "),
@@ -404,14 +409,12 @@ fn render_conflict(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Fram
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
-    frame.render_widget(
-        banner(
-            "⚠ agent modified this file on disk · [k]eep mine · [t]heirs · Esc to keep",
-            Color::Black,
-            Color::Yellow,
-        ),
-        split[0],
-    );
+    let msg = if area.width < NARROW_BANNER_WIDTH {
+        "⚠ conflict on disk"
+    } else {
+        "⚠ agent modified this file on disk · [k]eep mine · [t]heirs · Esc to keep"
+    };
+    frame.render_widget(banner(msg, Color::Black, Color::Yellow), split[0]);
     frame.render_widget(&buffer.textarea, split[1]);
 }
 
@@ -420,14 +423,12 @@ fn render_deleted(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
-    frame.render_widget(
-        banner(
-            "⚠ file removed on disk · [r]estore from buffer · [c]lose",
-            Color::White,
-            Color::Red,
-        ),
-        split[0],
-    );
+    let msg = if area.width < NARROW_BANNER_WIDTH {
+        "⚠ file removed"
+    } else {
+        "⚠ file removed on disk · [r]estore from buffer · [c]lose"
+    };
+    frame.render_widget(banner(msg, Color::White, Color::Red), split[0]);
     frame.render_widget(&buffer.textarea, split[1]);
 }
 

@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use similar::{ChangeTag, TextDiff};
 
-/// Snapshot of read-only git state we surface in HITLed.
+/// Snapshot of read-only git state we surface in Teep.
 ///
 /// gix is used only to verify that a directory is a git repo at all
 /// (it surfaces the most useful error when it's not). Everything else
@@ -333,10 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_on_hitled_repo_works() {
-        // This test runs inside the hitled git repo itself.
+    fn snapshot_on_teep_repo_works() {
+        // This test runs inside the teep git repo itself.
         let cwd = std::env::current_dir().unwrap();
-        let snap = snapshot(&cwd).expect("hitled repo should be snapshottable");
+        let snap = snapshot(&cwd).expect("teep repo should be snapshottable");
         assert!(
             snap.branch.is_some(),
             "should have a branch name on non-detached head"

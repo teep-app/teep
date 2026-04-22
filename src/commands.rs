@@ -54,7 +54,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "quit",
-        description: "Exit hitled",
+        description: "Exit teep",
         action: CommandAction::Quit,
     },
 ];

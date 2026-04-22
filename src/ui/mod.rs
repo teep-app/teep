@@ -58,6 +58,27 @@ pub fn view(state: &mut AppState, frame: &mut Frame) {
     }
 }
 
+/// Below this width the header drops the absolute session-root path; below
+/// NARROW it also drops the "N modified" footnote. The `to review` badge
+/// and branch survive all widths because they're the supervision signal.
+const HEADER_MEDIUM_WIDTH: u16 = 80;
+const HEADER_NARROW_WIDTH: u16 = 60;
+/// Middle-ellipsize branch names longer than this.
+const BRANCH_MAX_CHARS: usize = 24;
+
+fn middle_ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1); // 1 char for the ellipsis
+    let left = keep / 2;
+    let right = keep - left;
+    let chars: Vec<char> = s.chars().collect();
+    let l: String = chars[..left].iter().collect();
+    let r: String = chars[chars.len() - right..].iter().collect();
+    format!("{l}…{r}")
+}
+
 fn render_header(state: &AppState, area: ratatui::layout::Rect, frame: &mut Frame) {
     let root_label = state
         .root
@@ -65,9 +86,10 @@ fn render_header(state: &AppState, area: ratatui::layout::Rect, frame: &mut Fram
         .and_then(|s| s.to_str())
         .unwrap_or("");
     let unseen = state.changes.unseen_count();
+    let width = area.width;
 
     let mut spans: Vec<Span<'_>> = vec![Span::styled(
-        " hitled ",
+        " teep ",
         Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
@@ -90,12 +112,16 @@ fn render_header(state: &AppState, area: ratatui::layout::Rect, frame: &mut Fram
         spans.push(Span::raw(" "));
         spans.push(Span::styled("●", Style::default().fg(dot_color)));
         spans.push(Span::raw(" "));
+        let branch_raw = snap.branch.clone().unwrap_or_else(|| "(detached)".into());
+        let branch = middle_ellipsize(&branch_raw, BRANCH_MAX_CHARS);
         spans.push(Span::styled(
-            snap.branch.clone().unwrap_or_else(|| "(detached)".into()),
+            branch,
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        // If the session root is not itself the worktree root, indicate.
-        if let Some(wt_name) = snap.worktree_path.file_name().and_then(|s| s.to_str()) {
+        // Worktree indicator only at comfortable widths — it's informational.
+        if width >= HEADER_MEDIUM_WIDTH
+            && let Some(wt_name) = snap.worktree_path.file_name().and_then(|s| s.to_str())
+        {
             spans.push(Span::styled(
                 format!(" · wt:{wt_name}"),
                 Style::default().fg(Color::DarkGray),
@@ -108,7 +134,7 @@ fn render_header(state: &AppState, area: ratatui::layout::Rect, frame: &mut Fram
             .iter()
             .filter(|s| !matches!(s.kind, crate::git::StatusKind::Ignored))
             .count();
-        if dirty_count > 0 {
+        if dirty_count > 0 && width >= HEADER_NARROW_WIDTH {
             spans.push(Span::styled(
                 format!(" · {dirty_count} modified"),
                 Style::default().fg(Color::Yellow),
@@ -122,11 +148,14 @@ fn render_header(state: &AppState, area: ratatui::layout::Rect, frame: &mut Fram
         ));
     }
 
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        state.root.display().to_string(),
-        Style::default().fg(Color::DarkGray),
-    ));
+    // Absolute path only at wide widths — it's the first thing to drop.
+    if width >= HEADER_MEDIUM_WIDTH {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            state.root.display().to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     spans.push(Span::raw("  "));
     spans.push(if unseen == 0 {
         Span::styled("all reviewed", Style::default().fg(Color::DarkGray))

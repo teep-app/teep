@@ -30,9 +30,9 @@ use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "hitled",
+    name = "teep",
     version,
-    about = "A live window into a codebase being edited by an AI coding agent."
+    about = "Your private telepath for the agent writing your code."
 )]
 struct Cli {
     /// Repository root (defaults to current directory).
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("canonicalizing {}", p.display()))?,
         None => std::env::current_dir().context("getting current directory")?,
     };
-    info!(?root, "starting hitled");
+    info!(?root, "starting teep");
 
     // Probe the terminal for its graphics-protocol capability BEFORE we go
     // into raw mode + alt screen. The query sends escape sequences to stdout

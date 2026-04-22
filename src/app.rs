@@ -1066,7 +1066,7 @@ fn handle_file_loaded(state: &mut AppState, path: PathBuf, result: Result<Loaded
     state.changes.mark_seen(&path);
     // Detect an auto-reload (same path already open) so we can surface the
     // "↻ reloaded" toast — otherwise silent reloads leave the user wondering
-    // whether HITLed even noticed.
+    // whether Teep even noticed.
     let is_reload = state.open_file.as_ref().is_some_and(|f| f.path == path);
     // Reloading a file always invalidates its diff (it's vs HEAD of on-disk bytes).
     match result {
@@ -1243,9 +1243,11 @@ async fn run_session(
     let runtime = Runtime::new(events.sender(), root.to_path_buf());
     let _fs_watcher = fs_watch::spawn(root.to_path_buf(), events.sender())?;
 
-    // Tmux passthrough nag: if we're inside tmux, images typically silently
-    // fail unless allow-passthrough is enabled. Do this once per session.
-    if std::env::var("TMUX").is_ok() {
+    // Tmux passthrough nag: images need `allow-passthrough on` inside tmux
+    // to survive the multiplexer. Only nag when we actually have a
+    // graphics protocol — in halfblocks mode, the hint would be misleading
+    // because passthrough isn't what's holding us back.
+    if std::env::var("TMUX").is_ok() && crate::image::has_graphics_protocol() {
         set_status(
             &mut state,
             "tmux detected — run `tmux set -g allow-passthrough on` for image rendering"
@@ -1364,7 +1366,7 @@ mod tests {
 
     fn make_test_file(suffix: &str) -> PathBuf {
         let p =
-            std::env::temp_dir().join(format!("hitled_test_{}_{}.rs", std::process::id(), suffix));
+            std::env::temp_dir().join(format!("teep_test_{}_{}.rs", std::process::id(), suffix));
         std::fs::write(&p, "fn main(){}\n").unwrap();
         p
     }
@@ -1416,7 +1418,7 @@ mod tests {
         // Nonexistent-but-otherwise-ok paths are NOT noise — handle_fs_changed
         // handles them as deletions of the open file.
         assert!(
-            !is_noise(Path::new("/tmp/definitely_does_not_exist_hitled_test.rs")),
+            !is_noise(Path::new("/tmp/definitely_does_not_exist_teep_test.rs")),
             "nonexistent paths are handled by handle_fs_changed, not is_noise"
         );
     }
@@ -2075,7 +2077,7 @@ mod tests {
     }
 
     fn edit_test_path(suffix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("hitled_edit_{}_{}.rs", std::process::id(), suffix))
+        std::env::temp_dir().join(format!("teep_edit_{}_{}.rs", std::process::id(), suffix))
     }
 
     fn open_file_with_text(text: &str, path: PathBuf) -> OpenFile {

@@ -91,7 +91,6 @@ pub fn new_protocol(img: DynamicImage) -> StatefulProtocol {
 /// True when the terminal supports a real graphics protocol (Kitty / iTerm2
 /// / Sixel), not just the halfblocks fallback. Callers use this to decide
 /// whether to mention tmux passthrough in the onboarding toast.
-#[allow(dead_code)] // consumed in the M7 tmux-warning patch
 pub fn has_graphics_protocol() -> bool {
     picker()
         .lock()

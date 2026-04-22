@@ -1,14 +1,14 @@
 [package]
-name = "hitled"
+name = "teep"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
-description = "A live terminal window into a codebase being edited by an AI coding agent."
+description = "Your private telepath for the agent writing your code — a live terminal window into the codebase."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/raveli/hitled"
+repository = "https://github.com/raveli/teep"
 
 [[bin]]
-name = "hitled"
+name = "teep"
 path = "src/main.rs"
 
 [dependencies]
