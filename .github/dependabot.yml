@@ -1,0 +1,23 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      ratatui-stack:
+        patterns:
+          - "ratatui*"
+          - "crossterm*"
+          - "tui-textarea*"
+      syntect-stack:
+        patterns:
+          - "syntect*"
+          - "two-face*"
