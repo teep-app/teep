@@ -39,7 +39,7 @@ nucleo-matcher = "0.3"
 
 # M4: git integration
 gix = "0.81"
-similar = "2"
+similar = "3"
 
 # M5: edit mode
 tui-textarea = "0.7"
