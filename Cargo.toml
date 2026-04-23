@@ -13,8 +13,8 @@ name = "teep"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }
 futures = "0.3"
 clap = { version = "4.5", features = ["derive"] }
@@ -58,7 +58,7 @@ blake3 = "1"
 # default features include `chafa-dyn` which links libchafa (C dep) — skip it.
 # Our supported fallback when no graphics protocol is available is the plain
 # halfblock renderer built into ratatui-image.
-ratatui-image = { version = "9", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-image = { version = "10", default-features = false, features = ["crossterm", "image-defaults"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
