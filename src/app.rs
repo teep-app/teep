@@ -11,7 +11,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect, text::Line};
 use ratatui_image::protocol::StatefulProtocol;
-use tui_textarea::{Input, TextArea};
+use tui_textarea::{CursorMove, Input, TextArea};
 
 use crate::{
     changes::ChangeLog,
@@ -601,6 +601,23 @@ fn handle_edit_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
     };
     let buffer_path = open.path.clone();
     if let EditState::Edit(buffer) = &mut open.edit {
+        // PageUp/PageDown need a detour for live-preview buffers: tui-textarea's
+        // default handler clamps the cursor into the textarea's internal
+        // viewport via CursorMove::InViewport, but live preview never renders
+        // the textarea widget directly so the viewport stays at (0,0,0,0) —
+        // the clamp would teleport the cursor to row 0 every press. Translate
+        // to a bulk CursorMove::Up/Down by the same amount view-mode uses.
+        if buffer.is_live_preview() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            let mv = if matches!(key.code, KeyCode::PageDown) {
+                CursorMove::Down
+            } else {
+                CursorMove::Up
+            };
+            for _ in 0..PAGE_SCROLL {
+                buffer.textarea.move_cursor(mv);
+            }
+            return;
+        }
         let input: Input = Input::from(key);
         let mutated = buffer.textarea.input(input);
         if mutated && buffer.is_live_preview() {
@@ -2144,6 +2161,119 @@ mod tests {
             // At minimum the parse ran — the block count should reflect the
             // current buffer, which still has 1 block.
             assert_eq!(blocks.len(), initial_blocks);
+        } else {
+            panic!("expected Edit");
+        }
+    }
+
+    fn long_markdown_text(lines: usize) -> String {
+        let mut s = String::new();
+        for i in 0..lines {
+            s.push_str(&format!("line {i}\n\n"));
+        }
+        s
+    }
+
+    /// Regression test: in Live Preview, tui-textarea's default PageUp/Down
+    /// handler clamps the cursor to an uninitialised viewport and teleports
+    /// it to row 0. Our intercept should translate to a bulk CursorMove::Down
+    /// by PAGE_SCROLL rows.
+    #[test]
+    fn live_preview_pagedown_advances_cursor_by_page_scroll() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/longdoc.md"),
+            text: long_markdown_text(50),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+            image: None,
+            image_error: None,
+        });
+        update(&mut s, Msg::Key(plain('m')));
+        update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        );
+        if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
+            let (row, _) = b.textarea.cursor();
+            assert_eq!(row, PAGE_SCROLL, "cursor should move down by PAGE_SCROLL");
+        } else {
+            panic!("expected Edit");
+        }
+    }
+
+    #[test]
+    fn live_preview_pageup_moves_cursor_back() {
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/longdoc2.md"),
+            text: long_markdown_text(50),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+            image: None,
+            image_error: None,
+        });
+        update(&mut s, Msg::Key(plain('m')));
+        // Move cursor to row 30 via arrow-down.
+        for _ in 0..30 {
+            update(
+                &mut s,
+                Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            );
+        }
+        update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+        );
+        if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
+            let (row, _) = b.textarea.cursor();
+            assert_eq!(
+                row,
+                30 - PAGE_SCROLL,
+                "PageUp should move cursor up by PAGE_SCROLL, not teleport to 0"
+            );
+        } else {
+            panic!("expected Edit");
+        }
+    }
+
+    #[test]
+    fn live_preview_pagedown_clamps_at_last_line() {
+        // Buffer has 10 lines (content rows 0..9 plus a trailing empty). PageDown
+        // past the end must clamp, not wrap or panic.
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/short.md"),
+            text: long_markdown_text(5), // ~10 rows including blank separators
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::View,
+            image: None,
+            image_error: None,
+        });
+        update(&mut s, Msg::Key(plain('m')));
+        update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        );
+        if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
+            let (row, _) = b.textarea.cursor();
+            let last_row = b.textarea.lines().len().saturating_sub(1);
+            assert_eq!(row, last_row, "cursor should clamp to last line");
         } else {
             panic!("expected Edit");
         }
