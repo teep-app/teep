@@ -10,15 +10,44 @@ A terminal viewer, not an editor. Fast to start, quiet when nothing's happening,
 
 ---
 
-## Why
+## Install
 
-Agentic coding has a supervision problem. The agent scrolls tool calls and log lines in one pane; the actual source files are somewhere else. The usual options for keeping an eye on things are all bad:
+**macOS (primary):**
 
-1. Trust the agent and check `git diff` at the end — risky, no context.
-2. Jump into `nvim` / VS Code every few minutes — high friction, breaks your flow.
-3. Keep a `watch git status` running — better, but ugly and uncontextual.
+```sh
+brew install teep-app/teep/teep
+```
 
-Teep is the fourth option: a persistent, always-on, auto-refreshing, git-aware file viewer designed for one specific workflow — *a human supervising a coding agent in a split pane*.
+**Linux & fallback (shell installer):**
+
+```sh
+curl -fsSL https://github.com/teep-app/teep/releases/latest/download/teep-installer.sh | sh
+```
+
+**Direct download:** [releases page](https://github.com/teep-app/teep/releases/latest) — prebuilt tarballs for macOS (arm64 / x86_64) and Linux (x86_64 / aarch64), each with a SHA256 checksum.
+
+**Build from source (requires Rust 1.93+):**
+
+```sh
+git clone https://github.com/teep-app/teep
+cd teep
+cargo install --path .
+```
+
+**Optional runtime dep:** `mmdc` (mermaid-cli) for inline mermaid diagrams in Markdown. Without it, mermaid fences render as an honest placeholder with the source inside.
+
+```sh
+brew install mermaid-cli
+# or: npm i -g @mermaid-js/mermaid-cli
+```
+
+**Inside tmux:** run `tmux set -g allow-passthrough on` so the terminal graphics escape sequences reach Ghostty/iTerm2.
+
+---
+
+## What Teep does
+
+Teep is a persistent, always-on, auto-refreshing, git-aware file viewer designed for one specific workflow — *a human supervising a coding agent in a split pane*.
 
 ```mermaid
 flowchart LR
@@ -37,119 +66,57 @@ flowchart LR
 
 Solid arrows are the main flow: you drive the agent, the agent edits the repo. Dotted arrows are Teep's contribution: it tails the filesystem so you always know what just happened, and it lets you reach in and fix the occasional typo without context-switching out of the session.
 
----
+## Features
 
-## Status
-
-Early. Under active development. MVP in sight.
-
-| Milestone | State | What works |
-|---|---|---|
-| M1 — skeleton | done | Terminal bootstrap, event loop, config, logging |
-| M2 — tree + watch + viewer | done | File tree, live fs-watch, syntax-highlighted viewer, change log, `n`-cycle to next change |
-| M3 — fuzzy finder + palette | done | `/` fuzzy file finder, `:` command palette, `?` help |
-| M4 — git | done | Branch, status, worktrees, inline diffs |
-| M5 — edit + save | done | Small edits; conflict banner on agent overwrite |
-| M6 — Markdown render | done | GFM with tables, task lists, code blocks, styled inlines |
-| M6.5 — live preview (Obsidian-style) | done | Reveal-on-cursor: current block raw, everything else cooked |
-| M7 — inline images | done | Kitty / iTerm2 / Sixel / halfblocks fallback |
-| M7.1 — inline markdown images | done | `![](path)` renders in Live Preview, reveals source on cursor |
-| M8 — mermaid | done | Via `mmdc`, content-hash cached; placeholder when mmdc missing |
-| M9 — polish + release | in progress | Performance, docs, binary release |
-
-The killer feature is **beautiful Markdown rendering with inline images and mermaid diagrams, in the terminal, right next to the agent writing the Markdown.** Most of Teep exists to get there with the right foundation underneath.
-
----
-
-## Install and run
-
-Requires Rust 1.93+.
-
-```sh
-# Public install via Homebrew (once v0.1.0 ships):
-brew install teep-app/teep/teep
-
-# Or build from source (requires access to teep-app/source):
-git clone https://github.com/teep-app/source teep
-cd teep
-cargo install --path .
-```
-
-Then, in your repo:
-
-```sh
-teep .           # open the current directory
-teep path/to/repo
-```
-
-Put it in the right-hand pane of whatever terminal multiplexer you're using (tmux, Ghostty's split panes, WezTerm, Zellij, etc.) and your coding agent in the left.
-
-**Primary target terminal is Ghostty** because the Markdown feature leans on the Kitty graphics protocol for inline images. Everything *except* high-quality inline images works in any crossterm-compatible terminal (fallback to halfblocks).
-
-**Optional runtime dep**: `mmdc` (mermaid-cli, via `brew install mermaid-cli` or `npm i -g @mermaid-js/mermaid-cli`). Without it, mermaid blocks render as placeholders.
-
-**Inside tmux**: run `tmux set -g allow-passthrough on` so the graphics protocol escape sequences reach the terminal.
-
----
+- **Live file tree** respecting `.gitignore`, with a change log of every file the agent has touched since checkpoint.
+- **Syntax-highlighted viewer** with inline `git diff` vs HEAD.
+- **Worktree + branch switcher** for agents that juggle multiple worktrees.
+- **Beautiful Markdown**: GFM tables, task lists, code blocks (syntect-highlighted), Obsidian-style reveal-on-cursor editing.
+- **Inline images** via the Kitty graphics protocol (iTerm2, Sixel, and halfblocks fallbacks).
+- **Mermaid diagrams** rendered inline via `mmdc` with a content-hash cache.
+- **Small edits** for fixing the agent's typos without leaving the session — `i` to edit, `Ctrl-S` to save, `Esc` to exit.
 
 ## Keybindings
 
-Modeless navigation with a single modal concession for edit mode.
-
 | Key | Action |
 |---|---|
-| `↑` `↓` | Move tree selection / scroll viewer (depending on focus) |
-| `→` `←` | Expand / collapse dir in tree |
+| `↑` `↓` | Move tree selection / scroll viewer |
 | `Enter` / `o` | Open file (or toggle dir) |
 | `n` / `N` | Next / prev agent-changed file |
-| `u` | Mark all changes seen (checkpoint) |
-| `r` | Force tree refresh |
-| `Tab` | Switch focus: tree ↔ viewer |
-| `/` or `Ctrl-P` | Fuzzy open |
+| `u` | Checkpoint — mark all changes seen |
+| `/` or `Ctrl-P` | Fuzzy file finder |
 | `:` | Command palette |
-| `?` | Help overlay |
+| `?` | Help overlay (full keymap) |
 | `d` | Toggle inline diff vs HEAD |
 | `m` | Toggle Markdown Live Preview (on `.md` files) |
 | `g` | Git status overlay |
-| `b` | Branch / worktree switcher |
+| `b` | Worktree switcher |
 | `i` / `e` | Enter edit mode (`Esc` exits) |
 | `Ctrl-S` | Save |
 | `Ctrl-B` | Toggle sidebar |
-| `PgUp` / `PgDn` / `Home` / `End` | Scroll viewer |
 | `Ctrl-C Ctrl-C` | Quit |
-
-Footer always shows a context-aware subset. Full list in the `?` overlay.
-
----
-
-## Design principles
-
-1. **The agent is the real IDE.** Teep never competes with it. No LSP, no autocomplete, no multi-cursor, no language-specific refactoring.
-2. **Viewer-first.** Editing is possible but not the point.
-3. **Fast startup.** Launch in under 150 ms on a warm cache. If Teep feels heavy, it fails its job.
-4. **Live by default.** File tree, change log, diffs, and Markdown preview all update as the agent writes. No manual refresh keys.
-5. **Beautiful Markdown is the feature.** Most agentic work revolves around `.md` files — plans, specs, CLAUDE.md, READMEs. Teep exists to make those feel *good* in a terminal.
-6. **Graceful degradation.** If your terminal can't do the Kitty graphics protocol, images become halfblocks or placeholders and everything else still works.
-7. **Single small binary.** No chromium. No JVM. No Node. One `cargo install` and you're done. (External `mmdc` is the one optional exception.)
-
----
 
 ## Not for you if
 
-- You want a full editor. Use Neovim, Helix, or VS Code.
+- You want a full editor. Use Neovim, Helix, or VS Code — Teep never competes with them.
 - You don't work with AI coding agents. Teep's workflow assumes you do.
-- You live entirely in an IDE's integrated terminal and never split panes.
+- You live inside an IDE's integrated terminal and never split panes.
 
----
+## Status
 
-## Architecture in one paragraph
+Early. Under active development. v0.1 is the first public cut.
 
-Elm-style. A single `AppState`, a single `Msg` enum, a pure `update(state, msg) -> (state, Vec<Cmd>)` function. Terminal events, `notify` fs-watch events, and async job completions all funnel into one `mpsc::UnboundedReceiver<Msg>`. A `Runtime` executes `Cmd`s (file reads, syntax highlighting, git snapshot, diff, image decode) on spawned Tokio tasks, posting results back as `Msg`s. Rendering is a pure function of state, run on a 250 ms tick plus whenever a `Msg` is processed. The state layer has no ratatui dependency for its core logic, which makes `update` unit-testable without a terminal.
+## Issues, questions, security
 
----
+- **Bugs / feature requests:** open an issue on this repo.
+- **Security reports:** email **teep@teep.app** directly; please don't file a public issue for security-sensitive reports.
+- **General contact:** **teep@teep.app**.
+- **Contributions:** see [`CONTRIBUTING.md`](./CONTRIBUTING.md) — Teep is currently maintained by one person and not accepting drive-by PRs.
+
+## Acknowledgments
+
+Teep was developed collaboratively with [Claude Code](https://claude.ai/code).
 
 ## License
 
 Dual-licensed under [MIT](./LICENSE-MIT) or [Apache 2.0](./LICENSE-APACHE), at your option.
-
-Contributions welcome once v0.1 tags. Until then, issues and design feedback are more useful than patches.

@@ -13,10 +13,6 @@ installers = ["shell", "homebrew"]
 tap = "teep-app/homebrew-teep"
 # Publish jobs responsible for pushing the formula PR to the tap
 publish-jobs = ["homebrew"]
-# Releases live on the public dist repo, not on the private source repo.
-# Requires GH_RELEASES_TOKEN in teep-app/source secrets (contents:write on
-# teep-app/teep + teep-app/homebrew-teep).
-github-releases-repo = "teep-app/teep"
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "aarch64-apple-darwin",
