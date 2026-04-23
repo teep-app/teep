@@ -5,7 +5,8 @@ edition = "2024"
 rust-version = "1.93"
 description = "Your private telepath for the agent writing your code — a live terminal window into the codebase."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/raveli/teep"
+homepage = "https://teep.app"
+repository = "https://github.com/teep-app/source"
 
 [[bin]]
 name = "teep"

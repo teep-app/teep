@@ -66,7 +66,11 @@ The killer feature is **beautiful Markdown rendering with inline images and merm
 Requires Rust 1.93+.
 
 ```sh
-git clone https://github.com/raveli/teep
+# Public install via Homebrew (once v0.1.0 ships):
+brew install teep-app/teep/teep
+
+# Or build from source (requires access to teep-app/source):
+git clone https://github.com/teep-app/source teep
 cd teep
 cargo install --path .
 ```
