@@ -1,12 +1,16 @@
 # Teep
 
+[![CI](https://github.com/teep-app/teep/actions/workflows/ci.yml/badge.svg)](https://github.com/teep-app/teep/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/teep-app/teep?include_prereleases&sort=semver)](https://github.com/teep-app/teep/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 > *Your private telepath for the agent writing your code.*
 
 Teep sits in the pane next to your coding agent and reads the room. Every file the agent touches, every change it slips in, every edit that needs a second pair of eyes — Teep is already watching. Syntax-highlighted, git-aware, beautifully rendered Markdown, live the moment the agent writes it.
 
-*You drive the agent. Teep watches the agent.*
-
 A terminal viewer, not an editor. Fast to start, quiet when nothing's happening, impossible to miss when something is. Built in Rust. Ghostty-first. One binary plus the `git` you already have. Press `n` to jump to whatever the agent just did. Press `u` when you've seen enough. That's the loop.
+
+![Teep rendering a Markdown file with a Mermaid diagram inline](docs/screenshot.png)
 
 ---
 
@@ -45,9 +49,21 @@ brew install mermaid-cli
 
 ---
 
-## What Teep does
+## Quickstart
 
-Teep is a persistent, always-on, auto-refreshing, git-aware file viewer designed for one specific workflow — *a human supervising a coding agent in a split pane*.
+```sh
+brew install teep-app/teep/teep
+cd ~/your/repo
+teep .
+```
+
+Press `?` for the help overlay, `/` to fuzzy-find a file, and `m` on any `.md` to toggle Markdown Live Preview. `Ctrl-C` twice quits.
+
+---
+
+## How it works
+
+Teep is a persistent, always-on, auto-refreshing, git-aware file viewer designed for one specific workflow — a human supervising a coding agent in a split pane.
 
 ```mermaid
 flowchart LR
