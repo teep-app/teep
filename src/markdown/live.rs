@@ -46,6 +46,24 @@ fn clamp_height(h: u16) -> u16 {
     h.clamp(INLINE_IMAGE_MIN_ROWS, INLINE_IMAGE_MAX_ROWS)
 }
 
+/// Rough number of terminal rows a PNG of dims `(w, h)` will occupy when
+/// it's aspect-fitted to the preview pane. Assumes a typical ~100-cell
+/// pane and terminal cells roughly twice as tall as wide (holds for
+/// Ghostty, iTerm2, most monospace fonts). Much narrower or wider panes
+/// see a slight mis-reservation, still dramatically better than the
+/// fixed default — threading real pane width through the layout
+/// pipeline would be a bigger refactor than it's worth for v1.
+pub fn image_height_cells(image_w: u32, image_h: u32) -> u16 {
+    const ASSUMED_PANE_CELLS: f32 = 100.0;
+    const CELL_ASPECT_H_OVER_W: f32 = 2.0;
+    if image_w == 0 || image_h == 0 {
+        return INLINE_IMAGE_DEFAULT_ROWS;
+    }
+    let aspect = image_h as f32 / image_w as f32;
+    let rows = aspect * ASSUMED_PANE_CELLS / CELL_ASPECT_H_OVER_W;
+    clamp_height(rows.round().max(INLINE_IMAGE_MIN_ROWS as f32) as u16)
+}
+
 #[derive(Clone, Debug)]
 pub struct LiveBlock {
     /// First source line (0-indexed, inclusive).
@@ -107,6 +125,7 @@ pub fn parse_blocks(
     markdown_dir: Option<&Path>,
     mermaid_rendering: &HashSet<String>,
     mermaid_failed: &HashMap<String, String>,
+    image_dims: &HashMap<PathBuf, (u32, u32)>,
 ) -> Vec<LiveBlock> {
     let arena = Arena::new();
     let options = render::build_options();
@@ -134,9 +153,16 @@ pub fn parse_blocks(
         {
             let theme = crate::mermaid::DEFAULT_THEME;
             let hash = crate::mermaid::cache_key(&source, theme);
-            let height = clamp_height(height_override.unwrap_or(INLINE_IMAGE_DEFAULT_ROWS));
             if let Some(path) = crate::mermaid::cached_path(&hash) {
-                // Cache hit — render as a regular image block.
+                // Cache hit — render as a regular image block. Explicit
+                // fence override > aspect-aware auto-size > default.
+                let auto_height = image_dims
+                    .get(&path)
+                    .map(|(w, h)| image_height_cells(*w, *h));
+                let height = height_override
+                    .map(clamp_height)
+                    .or(auto_height)
+                    .unwrap_or(INLINE_IMAGE_DEFAULT_ROWS);
                 let alt = format!("mermaid:{}", &hash[..8.min(hash.len())]);
                 let image_ref = InlineImageRef {
                     path,
@@ -156,13 +182,19 @@ pub fn parse_blocks(
         } else {
             let image_ref = detect_image_paragraph(node)
                 .and_then(|(url, alt)| resolve_local_image(&url, markdown_dir).map(|p| (p, alt)))
-                .map(|(path, alt)| InlineImageRef {
-                    path,
-                    alt,
-                    height_cells: INLINE_IMAGE_DEFAULT_ROWS,
+                .map(|(path, alt)| {
+                    let height_cells = image_dims
+                        .get(&path)
+                        .map(|(w, h)| image_height_cells(*w, *h))
+                        .unwrap_or(INLINE_IMAGE_DEFAULT_ROWS);
+                    InlineImageRef {
+                        path,
+                        alt,
+                        height_cells,
+                    }
                 });
-            let cooked = if image_ref.is_some() {
-                vec![Line::from(""); INLINE_IMAGE_DEFAULT_ROWS as usize]
+            let cooked = if let Some(r) = &image_ref {
+                vec![Line::from(""); r.height_cells as usize]
             } else {
                 render::render_block_to_lines(node)
             };
@@ -342,7 +374,13 @@ mod tests {
     #[test]
     fn two_paragraphs_have_distinct_ranges() {
         let text = "first paragraph\n\nsecond paragraph\n";
-        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].source_end <= blocks[1].source_start);
     }
@@ -350,7 +388,13 @@ mod tests {
     #[test]
     fn heading_and_code_block_are_separate_blocks() {
         let text = "# Title\n\n```rust\nfn x() {}\n```\n";
-        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(blocks.len(), 2, "expected heading + code fence");
         assert_eq!(blocks[0].source_start, 0, "heading starts at line 0");
     }
@@ -358,7 +402,13 @@ mod tests {
     #[test]
     fn block_at_row_finds_containing_block() {
         let text = "# Title\n\nBody paragraph.\n";
-        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(block_at_row(&blocks, 0), Some(0), "line 0 = heading");
         assert_eq!(block_at_row(&blocks, 2), Some(1), "line 2 = paragraph");
     }
@@ -366,15 +416,87 @@ mod tests {
     #[test]
     fn block_at_row_returns_none_for_blank_row_between_blocks() {
         let text = "one\n\nthree\n";
-        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         // Line 1 is the blank between two paragraphs — not owned by either.
         assert_eq!(block_at_row(&blocks, 1), None);
     }
 
     #[test]
     fn cooked_lines_are_populated() {
-        let blocks = parse_blocks("# Hello\n", None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            "# Hello\n",
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(!blocks[0].cooked.is_empty());
+    }
+
+    #[test]
+    fn image_height_cells_wide_flowchart() {
+        // A 4:1 mermaid PNG should aspect-fit to ~13 rows at our 100-cell
+        // assumption, comfortably under the 40-row ceiling.
+        let h = image_height_cells(2400, 600);
+        assert!(
+            (12..=14).contains(&h),
+            "expected ~13 rows for 4:1 flowchart, got {h}"
+        );
+    }
+
+    #[test]
+    fn image_height_cells_portrait_clamps() {
+        // A portrait photo would compute tall enough to eat the pane; cap
+        // enforces the max.
+        assert_eq!(image_height_cells(800, 1600), INLINE_IMAGE_MAX_ROWS);
+    }
+
+    #[test]
+    fn image_height_cells_zero_dims_returns_default() {
+        assert_eq!(image_height_cells(0, 0), INLINE_IMAGE_DEFAULT_ROWS);
+        assert_eq!(image_height_cells(100, 0), INLINE_IMAGE_DEFAULT_ROWS);
+        assert_eq!(image_height_cells(0, 100), INLINE_IMAGE_DEFAULT_ROWS);
+    }
+
+    #[test]
+    fn parse_blocks_uses_aspect_aware_height_when_dims_known() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let png = write_tmp_png(tmp.path(), "diagram.png");
+        // `resolve_local_image` canonicalizes; key the dims map on the
+        // same canonical form or the lookup misses (on macOS /tmp is a
+        // symlink to /private/tmp).
+        let canonical = std::fs::canonicalize(&png).expect("canonicalize");
+        let text = format!("![]({})\n", png.display());
+
+        // Without dims: default height.
+        let blocks = parse_blocks(
+            &text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            blocks[0].image.as_ref().unwrap().height_cells,
+            INLINE_IMAGE_DEFAULT_ROWS,
+        );
+
+        // With dims (wide, 4:1): aspect-aware height.
+        let mut dims = HashMap::new();
+        dims.insert(canonical, (2400u32, 600u32));
+        let blocks = parse_blocks(&text, None, &HashSet::new(), &HashMap::new(), &dims);
+        let h = blocks[0].image.as_ref().unwrap().height_cells;
+        assert!(
+            h < INLINE_IMAGE_DEFAULT_ROWS,
+            "wide image should reserve fewer rows than default, got {h}",
+        );
+        assert_eq!(blocks[0].cooked.len(), h as usize);
     }
 
     fn write_tmp_png(dir: &Path, name: &str) -> PathBuf {
@@ -393,7 +515,13 @@ mod tests {
         write_tmp_png(tmp.path(), "a.png");
 
         let text = "![alt text](a.png)\n";
-        let blocks = parse_blocks(text, Some(tmp.path()), &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            Some(tmp.path()),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(blocks.len(), 1);
         let img = blocks[0].image.as_ref().expect("image block");
         assert_eq!(img.alt, "alt text");
@@ -407,7 +535,13 @@ mod tests {
         write_tmp_png(tmp.path(), "b.png");
 
         let text = "look: ![x](b.png) inline\n";
-        let blocks = parse_blocks(text, Some(tmp.path()), &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            Some(tmp.path()),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(blocks.len(), 1);
         assert!(
             blocks[0].image.is_none(),
@@ -419,21 +553,39 @@ mod tests {
     fn missing_image_falls_back_to_text_block() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let text = "![](nope.png)\n";
-        let blocks = parse_blocks(text, Some(tmp.path()), &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            Some(tmp.path()),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(blocks[0].image.is_none());
     }
 
     #[test]
     fn http_image_falls_back_to_text_block() {
         let text = "![](https://example.com/x.png)\n";
-        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(blocks[0].image.is_none());
     }
 
     #[test]
     fn data_uri_image_falls_back_to_text_block() {
         let text = "![](data:image/png;base64,AAAA)\n";
-        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(blocks[0].image.is_none());
     }
 
@@ -441,7 +593,13 @@ mod tests {
     fn relative_image_without_markdown_dir_falls_back() {
         // No markdown_dir → relative path cannot resolve.
         let text = "![](a.png)\n";
-        let blocks = parse_blocks(text, None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(blocks[0].image.is_none());
     }
 
@@ -450,7 +608,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let p = write_tmp_png(tmp.path(), "abs.png");
         let text = format!("![]({})\n", p.display());
-        let blocks = parse_blocks(&text, None, &HashSet::new(), &HashMap::new());
+        let blocks = parse_blocks(
+            &text,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(blocks[0].image.is_some(), "absolute path should resolve");
     }
 

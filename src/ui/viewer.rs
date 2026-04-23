@@ -348,7 +348,7 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
             height: (clipped_end - clipped_start) as u16,
         };
         match buffer.inline_images.get(&overlay.image.path) {
-            Some(InlineImageState::Loaded(cell)) => {
+            Some(InlineImageState::Loaded { protocol: cell, .. }) => {
                 let mut protocol = cell.borrow_mut();
                 let widget = ratatui_image::StatefulImage::<
                     ratatui_image::protocol::StatefulProtocol,

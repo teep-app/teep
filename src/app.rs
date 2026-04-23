@@ -190,8 +190,14 @@ pub enum InlineImageState {
     Loading,
     /// Decoded and wrapped in a `StatefulProtocol` ready to render. `RefCell`
     /// because `StatefulImage`'s render call needs `&mut protocol` but our
-    /// render path threads only `&AppState`.
-    Loaded(RefCell<StatefulProtocol>),
+    /// render path threads only `&AppState`. `width` and `height` are the
+    /// decoded pixel dimensions — needed by `parse_blocks` to size the
+    /// reserved block rect to the image's natural aspect ratio.
+    Loaded {
+        protocol: RefCell<StatefulProtocol>,
+        width: u32,
+        height: u32,
+    },
     /// Decode failed; displayed inline as `[image: alt · <error>]`.
     Failed(String),
 }
@@ -228,11 +234,13 @@ impl EditBuffer {
     pub fn new_live(initial: &str, markdown_dir: Option<PathBuf>) -> (Self, BufferDeltas) {
         let mermaid_rendering: HashSet<String> = HashSet::new();
         let mermaid_failed: HashMap<String, String> = HashMap::new();
+        let image_dims: HashMap<PathBuf, (u32, u32)> = HashMap::new();
         let blocks = markdown::parse_blocks(
             initial,
             markdown_dir.as_deref(),
             &mermaid_rendering,
             &mermaid_failed,
+            &image_dims,
         );
         let lines: Vec<String> = initial.split('\n').map(|s| s.to_string()).collect();
         let mut inline_images: HashMap<PathBuf, InlineImageState> = HashMap::new();
@@ -283,11 +291,13 @@ impl EditBuffer {
             return BufferDeltas::default();
         }
         let text = self.current_text();
+        let image_dims = self.image_dims_map();
         let blocks = markdown::parse_blocks(
             &text,
             self.markdown_dir.as_deref(),
             &self.mermaid_rendering,
             &self.mermaid_failed,
+            &image_dims,
         );
         let mut deltas = BufferDeltas::default();
         for b in &blocks {
@@ -312,6 +322,21 @@ impl EditBuffer {
 
     pub fn is_live_preview(&self) -> bool {
         self.live_blocks.is_some()
+    }
+
+    /// Extract pixel dims of every inline image that's finished decoding.
+    /// Feeds `parse_blocks` so image blocks can reserve space matching the
+    /// image's natural aspect ratio rather than a fixed default.
+    fn image_dims_map(&self) -> HashMap<PathBuf, (u32, u32)> {
+        self.inline_images
+            .iter()
+            .filter_map(|(p, st)| match st {
+                InlineImageState::Loaded { width, height, .. } => {
+                    Some((p.clone(), (*width, *height)))
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -765,10 +790,24 @@ fn handle_inline_image_loaded(
         return;
     }
     let new_state = match result {
-        Ok(img) => InlineImageState::Loaded(RefCell::new(crate::image::new_protocol(img))),
+        Ok(img) => {
+            let width = img.width();
+            let height = img.height();
+            InlineImageState::Loaded {
+                protocol: RefCell::new(crate::image::new_protocol(img)),
+                width,
+                height,
+            }
+        }
         Err(e) => InlineImageState::Failed(e),
     };
     buffer.inline_images.insert(image_path, new_state);
+    // Re-parse so the now-known dims feed into the aspect-aware height
+    // calculation on the next render. No new Msg/Cmd — live_blocks just
+    // reshape in place.
+    if buffer.is_live_preview() {
+        let _ = buffer.refresh_live_blocks();
+    }
 }
 
 fn handle_mermaid_rendered(
