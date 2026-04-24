@@ -266,7 +266,7 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
         .live_blocks
         .as_ref()
         .expect("called with live blocks");
-    let (cursor_row, cursor_col) = buffer.textarea.cursor();
+    let ratatui_textarea::DataCursor(cursor_row, cursor_col) = buffer.textarea.cursor();
     let current_block_idx = crate::markdown::block_at_row(blocks, cursor_row);
     let lines = buffer.textarea.lines();
     let total_rows = lines.len();

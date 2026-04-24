@@ -1,8 +1,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
-use notify::{RecursiveMode, Watcher};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, FileIdMap, new_debouncer};
+use notify::RecursiveMode;
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
@@ -11,7 +11,7 @@ use crate::app::Msg;
 /// Keeps the debouncer alive for as long as this struct is alive.
 /// Dropping it stops the watcher.
 pub struct FsWatcher {
-    _debouncer: Debouncer<notify::RecommendedWatcher, FileIdMap>,
+    _debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
 }
 
 pub fn spawn(root: PathBuf, tx: UnboundedSender<Msg>) -> Result<FsWatcher> {
@@ -41,7 +41,6 @@ pub fn spawn(root: PathBuf, tx: UnboundedSender<Msg>) -> Result<FsWatcher> {
     .context("creating fs debouncer")?;
 
     debouncer
-        .watcher()
         .watch(&root, RecursiveMode::Recursive)
         .with_context(|| format!("watching {}", root.display()))?;
 
