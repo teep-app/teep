@@ -11,7 +11,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect, text::Line};
 use ratatui_image::protocol::StatefulProtocol;
-use tui_textarea::{CursorMove, Input, TextArea};
+use ratatui_textarea::{CursorMove, Input, TextArea};
 
 use crate::{
     changes::ChangeLog,
@@ -185,6 +185,7 @@ pub struct EditBuffer {
 }
 
 /// State of an inline markdown image's decode.
+#[allow(clippy::large_enum_variant)] // Loaded wraps ratatui-image's StatefulProtocol (~280B); other variants are rare.
 pub enum InlineImageState {
     /// Decode is in flight; the runtime will deliver `Msg::InlineImageLoaded`.
     Loading,
@@ -2239,7 +2240,7 @@ mod tests {
             Msg::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
         );
         if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
-            let (row, _) = b.textarea.cursor();
+            let ratatui_textarea::DataCursor(row, _) = b.textarea.cursor();
             assert_eq!(row, PAGE_SCROLL, "cursor should move down by PAGE_SCROLL");
         } else {
             panic!("expected Edit");
@@ -2275,7 +2276,7 @@ mod tests {
             Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
         );
         if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
-            let (row, _) = b.textarea.cursor();
+            let ratatui_textarea::DataCursor(row, _) = b.textarea.cursor();
             assert_eq!(
                 row,
                 30 - PAGE_SCROLL,
@@ -2310,7 +2311,7 @@ mod tests {
             Msg::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
         );
         if let EditState::Edit(b) = &s.open_file.as_ref().unwrap().edit {
-            let (row, _) = b.textarea.cursor();
+            let ratatui_textarea::DataCursor(row, _) = b.textarea.cursor();
             let last_row = b.textarea.lines().len().saturating_sub(1);
             assert_eq!(row, last_row, "cursor should clamp to last line");
         } else {

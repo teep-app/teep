@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
-use notify::{RecursiveMode, Watcher};
+use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, Debouncer, FileIdMap, new_debouncer};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
@@ -41,7 +41,6 @@ pub fn spawn(root: PathBuf, tx: UnboundedSender<Msg>) -> Result<FsWatcher> {
     .context("creating fs debouncer")?;
 
     debouncer
-        .watcher()
         .watch(&root, RecursiveMode::Recursive)
         .with_context(|| format!("watching {}", root.display()))?;
 

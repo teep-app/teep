@@ -13,14 +13,14 @@ name = "teep"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }
 futures = "0.3"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-directories = "5"
+toml = "1"
+directories = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
@@ -28,8 +28,8 @@ anyhow = "1"
 thiserror = "2"
 
 # M2: file tree, fs-watch, syntax highlighting
-notify = "6"
-notify-debouncer-full = "0.3"
+notify = "8"
+notify-debouncer-full = "0.7"
 ignore = "0.4"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
@@ -39,10 +39,12 @@ nucleo-matcher = "0.3"
 
 # M4: git integration
 gix = "0.81"
-similar = "2"
+similar = "3"
 
 # M5: edit mode
-tui-textarea = "0.7"
+# NOTE: upstream `tui-textarea` is unmaintained as of 2026; the ratatui org
+# forked it to `ratatui-textarea`, which tracks ratatui 0.30+.
+ratatui-textarea = "0.9"
 
 # M6: markdown rendering (Level A)
 # default-features disables comrak's built-in syntect highlighter (which pulls
@@ -58,7 +60,7 @@ blake3 = "1"
 # default features include `chafa-dyn` which links libchafa (C dep) — skip it.
 # Our supported fallback when no graphics protocol is available is the plain
 # halfblock renderer built into ratatui-image.
-ratatui-image = { version = "9", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-image = { version = "10", default-features = false, features = ["crossterm", "image-defaults"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
