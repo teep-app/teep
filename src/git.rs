@@ -334,13 +334,11 @@ mod tests {
 
     #[test]
     fn snapshot_on_teep_repo_works() {
-        // This test runs inside the teep git repo itself.
+        // This test runs inside the teep git repo itself. `branch` is
+        // intentionally not asserted — CI (actions/checkout) checks out the
+        // PR merge commit in detached-HEAD state, where branch is `None`.
         let cwd = std::env::current_dir().unwrap();
         let snap = snapshot(&cwd).expect("teep repo should be snapshottable");
-        assert!(
-            snap.branch.is_some(),
-            "should have a branch name on non-detached head"
-        );
         assert!(snap.head_short.is_some(), "should have a head SHA");
         assert!(!snap.worktrees.is_empty(), "at least the current worktree");
         assert!(
