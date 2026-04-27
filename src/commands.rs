@@ -13,6 +13,7 @@ pub struct Command {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandAction {
     ToggleSidebar,
+    ToggleWordWrap,
     RefreshTree,
     CheckpointChanges,
     ShowHelp,
@@ -36,6 +37,11 @@ pub const COMMANDS: &[Command] = &[
         name: "sidebar",
         description: "Show or hide the sidebar",
         action: CommandAction::ToggleSidebar,
+    },
+    Command {
+        name: "wrap",
+        description: "Toggle soft word wrap",
+        action: CommandAction::ToggleWordWrap,
     },
     Command {
         name: "git",
