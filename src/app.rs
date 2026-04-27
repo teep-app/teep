@@ -1596,7 +1596,10 @@ mod tests {
         });
         assert!(s.sidebar_visible);
         update(&mut s, Msg::Key(ctrl('b')));
-        assert!(!s.sidebar_visible, "Ctrl-B must toggle sidebar in edit mode");
+        assert!(
+            !s.sidebar_visible,
+            "Ctrl-B must toggle sidebar in edit mode"
+        );
     }
 
     #[test]
