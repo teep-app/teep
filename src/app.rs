@@ -40,6 +40,9 @@ pub struct AppState {
     pub open_file: Option<OpenFile>,
     pub focus: Focus,
     pub sidebar_visible: bool,
+    /// Soft word wrap toggle, applies in view, plain edit, and markdown
+    /// live-preview render paths. Toggle with Alt-Z or `:wrap`.
+    pub wrap_lines: bool,
     pub status: Option<(String, Instant)>,
     /// Populated by `ui::view` each frame so `handle_mouse` can route clicks
     /// back to the thing that was visible at that screen cell.
@@ -467,6 +470,21 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
         return;
     }
 
+    // Display toggles work in every mode (view, edit, live preview, banner
+    // states) — they affect chrome, not the buffer. Checked before the
+    // mode dispatch so edit-mode handlers don't swallow them.
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('b'), m) if m.contains(KeyModifiers::CONTROL) => {
+            state.sidebar_visible = !state.sidebar_visible;
+            return;
+        }
+        (KeyCode::Char('z'), m) if m.contains(KeyModifiers::ALT) => {
+            toggle_word_wrap(state);
+            return;
+        }
+        _ => {}
+    }
+
     // Edit mode + banner states own the keyboard next.
     let edit_kind = state.open_file.as_ref().map(|f| match &f.edit {
         EditState::View => 0u8,
@@ -509,9 +527,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) {
     }
 
     match (key.code, key.modifiers) {
-        (KeyCode::Char('b'), m) if m.contains(KeyModifiers::CONTROL) => {
-            state.sidebar_visible = !state.sidebar_visible;
-        }
         (KeyCode::Tab, _) => {
             state.focus = match state.focus {
                 Focus::Tree => Focus::Viewer,
@@ -874,6 +889,15 @@ fn m_key(state: &mut AppState, cmds: &mut Vec<Cmd>) {
     enter_edit_mode(state, cmds);
 }
 
+fn toggle_word_wrap(state: &mut AppState) {
+    state.wrap_lines = !state.wrap_lines;
+    let on = state.wrap_lines;
+    set_status(
+        state,
+        format!("word wrap: {}", if on { "on" } else { "off" }),
+    );
+}
+
 fn toggle_diff(state: &mut AppState, cmds: &mut Vec<Cmd>) {
     let Some(f) = state.open_file.as_mut() else {
         set_status(state, "no file open".to_string());
@@ -1021,6 +1045,7 @@ fn handle_overlay_key(state: &mut AppState, key: KeyEvent, cmds: &mut Vec<Cmd>) 
 fn execute_command_action(state: &mut AppState, action: CommandAction, cmds: &mut Vec<Cmd>) {
     match action {
         CommandAction::ToggleSidebar => state.sidebar_visible = !state.sidebar_visible,
+        CommandAction::ToggleWordWrap => toggle_word_wrap(state),
         CommandAction::RefreshTree => {
             state.tree_dirty = false;
             state.last_tree_rebuild = Instant::now();
@@ -1409,6 +1434,7 @@ async fn run_session(
         open_file: None,
         focus: Focus::Tree,
         sidebar_visible: true,
+        wrap_lines: true,
         status: None,
         mouse_layout: MouseLayout::default(),
         overlay: Overlay::None,
@@ -1472,6 +1498,7 @@ mod tests {
             open_file: None,
             focus: Focus::Tree,
             sidebar_visible: true,
+            wrap_lines: true,
             status: None,
             mouse_layout: MouseLayout::default(),
             overlay: Overlay::None,
@@ -1493,6 +1520,10 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
 
     #[test]
@@ -1543,6 +1574,42 @@ mod tests {
         assert!(!s.sidebar_visible);
         update(&mut s, Msg::Key(ctrl('b')));
         assert!(s.sidebar_visible);
+    }
+
+    #[test]
+    fn ctrl_b_toggles_sidebar_in_edit_mode() {
+        // Regression: edit-mode key handler used to swallow Ctrl-B by
+        // forwarding it into the textarea, leaving the sidebar stuck.
+        let mut s = fixture();
+        s.open_file = Some(OpenFile {
+            path: PathBuf::from("/tmp/foo.md"),
+            text: String::new(),
+            highlighted: Arc::new(Vec::new()),
+            scroll: 0,
+            error: None,
+            diff_mode: false,
+            diff: None,
+            diff_error: None,
+            edit: EditState::Edit(EditBuffer::new("hello\n")),
+            image: None,
+            image_error: None,
+        });
+        assert!(s.sidebar_visible);
+        update(&mut s, Msg::Key(ctrl('b')));
+        assert!(
+            !s.sidebar_visible,
+            "Ctrl-B must toggle sidebar in edit mode"
+        );
+    }
+
+    #[test]
+    fn alt_z_toggles_word_wrap() {
+        let mut s = fixture();
+        assert!(s.wrap_lines);
+        update(&mut s, Msg::Key(alt('z')));
+        assert!(!s.wrap_lines);
+        update(&mut s, Msg::Key(alt('z')));
+        assert!(s.wrap_lines);
     }
 
     fn make_test_file(suffix: &str) -> PathBuf {

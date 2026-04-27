@@ -11,5 +11,7 @@
 
 pub mod live;
 pub mod render;
+pub mod wrap;
 
 pub use live::{InlineImageRef, LiveBlock, block_at_row, parse_blocks};
+pub use wrap::wrap_styled_line;

@@ -373,6 +373,7 @@ fn render_help(area: Rect, frame: &mut Frame) {
         row("k / t", "(conflict) keep mine / take theirs"),
         row("r / c", "(deleted) restore buffer / close"),
         row("Ctrl-B", "toggle sidebar"),
+        row("Alt-Z", "toggle soft word wrap"),
         row("Click", "select / focus"),
         row("Click twice", "open file or toggle dir"),
         row("Scroll", "scroll the pane under the cursor"),

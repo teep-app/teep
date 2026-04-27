@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 use crate::app::{AppState, EditState, Focus, InlineImageState, OpenFile};
@@ -112,7 +112,7 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
 
     match &open.edit {
         EditState::Edit(buffer) => {
-            render_edit(buffer, inner, frame);
+            render_edit(buffer, state.wrap_lines, inner, frame);
             return;
         }
         EditState::Conflict { buffer } => {
@@ -164,7 +164,11 @@ fn render_body(state: &AppState, area: Rect, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(gutter), gutter_area);
 
     let body: Vec<Line> = open.highlighted[start..end].to_vec();
-    frame.render_widget(Paragraph::new(body), content_area);
+    let mut p = Paragraph::new(body);
+    if state.wrap_lines {
+        p = p.wrap(Wrap { trim: false });
+    }
+    frame.render_widget(p, content_area);
 }
 
 fn render_diff(open: &OpenFile, area: Rect, frame: &mut Frame) {
@@ -237,10 +241,13 @@ fn render_image(
     frame.render_stateful_widget(widget, area, &mut *protocol);
 }
 
-fn render_edit(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
+fn render_edit(buffer: &crate::app::EditBuffer, wrap_lines: bool, area: Rect, frame: &mut Frame) {
     if buffer.live_blocks.is_some() {
-        render_live_preview(buffer, area, frame);
+        render_live_preview(buffer, wrap_lines, area, frame);
     } else {
+        // Plain text edit: ratatui-textarea renders its own widget — wrap
+        // is a no-op here for v1. The wrap toggle still affects view and
+        // markdown-preview modes.
         frame.render_widget(&buffer.textarea, area);
     }
 }
@@ -256,7 +263,12 @@ fn render_edit(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
 /// `StatefulImage` widget on that rect. When the cursor is on an image
 /// block, it falls into the raw-source branch and no overlay happens —
 /// consistent with Level-B reveal-on-cursor.
-fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut Frame) {
+fn render_live_preview(
+    buffer: &crate::app::EditBuffer,
+    wrap_lines: bool,
+    area: Rect,
+    frame: &mut Frame,
+) {
     struct ImageOverlay<'a> {
         visual_start: usize,
         image: &'a InlineImageRef,
@@ -274,6 +286,9 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
     let mut visual: Vec<Line<'static>> = Vec::new();
     let mut cursor_visual: Option<(usize, usize)> = None;
     let mut image_overlays: Vec<ImageOverlay> = Vec::new();
+    // Pane width for soft-wrapping cooked lines. Image-block reservations
+    // and the cursor's raw-source block are passed through unwrapped.
+    let wrap_width = area.width as usize;
 
     let mut row = 0;
     while row < total_rows {
@@ -292,8 +307,15 @@ fn render_live_preview(buffer: &crate::app::EditBuffer, area: Rect, frame: &mut 
             } else {
                 // Cooked — emit the pre-rendered block lines in place.
                 let block_visual_start = visual.len();
+                let is_image = block.image.is_some();
                 for cooked in &block.cooked {
-                    visual.push(cooked.clone());
+                    if wrap_lines && !is_image {
+                        for wrapped in crate::markdown::wrap_styled_line(cooked, wrap_width) {
+                            visual.push(wrapped);
+                        }
+                    } else {
+                        visual.push(cooked.clone());
+                    }
                 }
                 if let Some(img) = &block.image {
                     image_overlays.push(ImageOverlay {
